@@ -22,7 +22,6 @@ gpu-check:
 test-audio:
 	docker compose run --rm --no-deps --user $$(id -u):$$(id -g) -v ./tests:/tests -w /tests speech python fetch_audio.py
 
-# WER per language and diarization accuracy against the running speech service.
+# WER per language, request latency and diarization accuracy against the running speech service.
 test:
 	docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py
-	docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py diarize

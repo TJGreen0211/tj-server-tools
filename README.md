@@ -47,13 +47,13 @@ curl -F file=@meeting.mp3 -F diarize=true -F response_format=text localhost:5003
 
 | Field | Default | Notes |
 |---|---|---|
-| `file` | required | Any format ffmpeg reads |
+| `file` | required | Any format ffmpeg reads. Repeat the field to send several parts (e.g. a paused recording); they are joined in order |
 | `response_format` | `json` | `json`, `text`, `verbose_json` (segments + words with timestamps), `srt`, `vtt` |
 | `diarize` | `false` | Adds `speaker` to segments and words |
 | `num_speakers` | none | Set it when you know the count; improves accuracy |
 | `max_speakers` | `8` | Upper bound when the count is unknown |
 
-The audio is always split into speaker turns first and each turn is transcribed separately. Parakeet locks onto one language per stretch of audio, so this keeps English and Spanish turns from dropping each other. A single speaker switching languages mid-sentence is still a weak spot.
+Without `diarize`, the whole clip goes straight to Parakeet (about 100 ms for a 3 s clip), which suits dictation and live previews. With `diarize=true`, the audio is split into speaker turns and each turn is transcribed separately. Parakeet locks onto one language per stretch of audio, so a recording that mixes English and Spanish should use `diarize=true`, or its minority language can be dropped. A single speaker switching languages mid-sentence is a weak spot either way.
 
 ## Text to speech
 
@@ -91,8 +91,10 @@ Results on the 7900 XTX:
 | Test | Result |
 |---|---|
 | English, 20 clips | 1.94% WER |
-| Spanish, 20 clips | 3.30% WER |
-| Mixed en/es conversation, 6 speakers | 2.41% WER, 6 speakers found, 100% of words on the right speaker, ~30x real time |
+| Spanish, 20 clips | 3.45% WER |
+| Request latency (`diarize=false`) | 3 s clip: ~100 ms median; 10–20 s clip: ~150 ms median |
+| Mixed en/es conversation, 6 speakers, `diarize=true` | 2.41% WER, 6 speakers found, 100% of words on the right speaker, ~30x real time |
+| Same conversation sent as 2 webm/opus parts | 4.83% WER, labels still 100% correct |
 | TTS, en/es, built-in and cloned voice | Parakeet reads it back at ~4% WER; generation is about real time |
 
 The conversation is clean read speech with no cross-talk, so real meetings will score lower.

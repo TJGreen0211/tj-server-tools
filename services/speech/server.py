@@ -3,6 +3,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, File, Form, UploadFile
@@ -40,12 +41,34 @@ def to_wav(src: Path, dst: Path) -> None:
     )
 
 
-def transcribe(wav: Path, work_dir: Path, num_speakers: int | None, max_speakers: int) -> dict:
+def load_audio(uploads: list[UploadFile], work_dir: Path) -> tuple[Path, np.ndarray]:
+    """Decode every upload to 16 kHz mono and join them in order (e.g. the parts of a paused recording)."""
+    parts = []
+    for i, upload in enumerate(uploads):
+        src, dst = work_dir / f"input{i}", work_dir / f"part{i}.wav"
+        src.write_bytes(upload.file.read())
+        to_wav(src, dst)
+        parts.append(sf.read(dst, dtype="float32")[0])
+    audio = np.concatenate(parts)
+    wav = work_dir / "audio.wav"
+    sf.write(wav, audio, SAMPLE_RATE)
+    return wav, audio
+
+
+def transcribe_plain(audio: np.ndarray) -> dict:
+    """Whole clip in one pass: fast, for short single-speaker audio like dictation."""
+    with gpu_lock, torch.inference_mode():
+        hyp = model.transcribe([audio], timestamps=True, verbose=False)[0]
+    segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["segment"]} for s in hyp.timestamp["segment"]]
+    words = [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2)} for w in hyp.timestamp["word"]]
+    return {"text": hyp.text, "segments": segments, "words": words}
+
+
+def transcribe_diarized(wav: Path, audio: np.ndarray, work_dir: Path, num_speakers: int | None, max_speakers: int) -> dict:
     """Diarize, then transcribe each speaker turn on its own.
 
     Parakeet picks one language per stretch of audio, so transcribing turns separately
     keeps English and Spanish turns from swallowing each other."""
-    audio, _ = sf.read(wav, dtype="float32")
     with gpu_lock, torch.inference_mode():
         turns = diarize(wav, work_dir, num_speakers, max_speakers)
         clips = [audio[int(t["start"] * SAMPLE_RATE): int(t["end"] * SAMPLE_RATE)] for t in turns]
@@ -87,7 +110,7 @@ def health():
 
 @app.post("/v1/audio/transcriptions")
 def transcriptions(
-    file: UploadFile = File(...),
+    file: list[UploadFile] = File(...),
     model_name: str = Form(MODEL_NAME, alias="model"),
     response_format: str = Form("json"),
     diarize: bool = Form(False),
@@ -95,14 +118,11 @@ def transcriptions(
     max_speakers: int = Form(8),
 ):
     with tempfile.TemporaryDirectory() as tmp:
-        src, wav = Path(tmp) / "input", Path(tmp) / "audio.wav"
-        src.write_bytes(file.file.read())
-        to_wav(src, wav)
-        result = transcribe(wav, Path(tmp), num_speakers, max_speakers)
-
-    if not diarize:
-        for item in result["segments"] + result["words"]:
-            item.pop("speaker")
+        wav, audio = load_audio(file, Path(tmp))
+        if diarize:
+            result = transcribe_diarized(wav, audio, Path(tmp), num_speakers, max_speakers)
+        else:
+            result = transcribe_plain(audio)
 
     if response_format == "text":
         if diarize:
