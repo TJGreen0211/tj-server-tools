@@ -1,0 +1,28 @@
+.PHONY: build up down logs gpu-check test-audio test
+
+build:
+	docker compose build
+
+up:
+	docker compose up -d
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f
+
+# Confirm the containers see only the configured GPU.
+gpu-check:
+	docker compose run --rm --no-deps speech python -c "import torch; \
+	print('hip', torch.version.hip, '| devices', torch.cuda.device_count()); \
+	[print(i, torch.cuda.get_device_name(i), torch.cuda.get_device_properties(i).gcnArchName) for i in range(torch.cuda.device_count())]"
+
+# Download public test clips (LibriSpeech + MLS Spanish, CC-BY 4.0) into tests/audio.
+test-audio:
+	docker compose run --rm --no-deps --user $$(id -u):$$(id -g) -v ./tests:/tests -w /tests speech python fetch_audio.py
+
+# WER per language and diarization accuracy against the running speech service.
+test:
+	docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py
+	docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py diarize

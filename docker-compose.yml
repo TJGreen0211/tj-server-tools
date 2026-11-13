@@ -1,0 +1,28 @@
+x-gpu: &gpu
+  devices:
+    - /dev/kfd
+    - /dev/dri/${RENDER_NODE:?set RENDER_NODE in .env}
+  group_add:
+    - "${VIDEO_GID:?set VIDEO_GID in .env}"
+    - "${RENDER_GID:?set RENDER_GID in .env}"
+  security_opt:
+    - seccomp=unconfined
+  restart: unless-stopped
+
+services:
+  speech:
+    <<: *gpu
+    build: services/speech
+    ports:
+      - "0.0.0.0:${SPEECH_PORT:-5003}:8000"
+    volumes:
+      - ./models:/models
+
+  tts:
+    <<: *gpu
+    build: services/tts
+    ports:
+      - "0.0.0.0:${TTS_PORT:-5004}:8000"
+    volumes:
+      - ./models:/models
+      - ./voices:/voices

@@ -1,0 +1,6 @@
+.env
+models/
+voices/
+tests/audio/
+__pycache__/
+tests/out/
