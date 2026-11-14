@@ -69,7 +69,8 @@ class StreamDecoder:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self._buf = np.zeros(SAMPLE_RATE * 60, dtype=np.int16)
-        self._len = 0
+        self._len = 0      # samples held in _buf
+        self._base = 0     # samples dropped from the front (already processed); indices stay absolute
         self._lock = threading.Lock()
         self._errors = b""
         self._closed = False
@@ -118,7 +119,11 @@ class StreamDecoder:
             self.proc.stdin.close()
         except OSError:
             pass
-        self.proc.wait(timeout)
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:  # a hung decoder: keep what it produced, don't fail the request
+            self.proc.kill()
+            self.proc.wait(10)
         self._reader.join(timeout)
         self._err_reader.join(timeout)
         self._close_pipes()
@@ -142,8 +147,24 @@ class StreamDecoder:
                 pass
 
     def __len__(self):
-        return self._len
+        """Samples decoded so far, including any already dropped."""
+        return self._base + self._len
 
     def slice(self, start: int, end: int) -> np.ndarray:
         with self._lock:
-            return self._buf[start:min(end, self._len)].astype(np.float32) / 32768.0
+            if start < self._base:
+                raise ValueError(f"samples before {self._base} were already dropped")
+            lo, hi = start - self._base, min(end - self._base, self._len)
+            return self._buf[lo:max(lo, hi)].astype(np.float32) / 32768.0
+
+    def drop_before(self, index: int):
+        """Frees the samples before `index` (absolute); they can't be sliced afterwards. A long
+        meeting then only keeps its unprocessed tail in memory, not the whole recording."""
+        with self._lock:
+            k = min(index - self._base, self._len)
+            if k <= 0:
+                return
+            keep = self._buf[k:self._len]
+            buf = np.zeros(max(len(keep) * 2, SAMPLE_RATE * 60), dtype=np.int16)
+            buf[:len(keep)] = keep
+            self._buf, self._len, self._base = buf, len(keep), self._base + k

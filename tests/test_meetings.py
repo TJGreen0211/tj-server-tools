@@ -198,6 +198,31 @@ class Sessions(unittest.TestCase):
         self.assertEqual(s.finish()["segments"], [])
         self.assertEqual(model.calls, [])
 
+    def test_retried_piece_is_not_appended_twice(self):
+        model = StubModel()
+        s = meetings.Session(model, None, 8)
+        track = self._speechy(12)
+        pieces = chunks(to_webm(track), 5000)
+        for i, c in enumerate(pieces):
+            self.assertTrue(s.append(1, c, seq=i))
+            if i == 2:
+                self.assertFalse(s.append(1, c, seq=i), "a retry of a piece already received is ignored")
+        with self.assertRaises(meetings.SessionError):
+            s.append(1, b"x", seq=len(pieces) + 1)      # a gap can't be decoded past
+        s.finish()
+        self.assertAlmostEqual(sum(c["seconds"] for c in model.calls), len(track) / SR, delta=0.1)
+
+    def test_processed_audio_is_freed(self):
+        s = meetings.Session(StubModel(), None, 8)
+        for c in chunks(to_webm(self._speechy(64)), 8000):
+            s.append(1, c)
+        s.process(final=False)
+        decoder = s.parts[0][1]
+        self.assertGreater(decoder._base, 0, "audio before the processed point should be dropped")
+        self.assertLessEqual(decoder._len, len(decoder) - s.done + 1)
+        result = s.finish()                              # slicing the tail still works after dropping
+        self.assertGreater(result["segments"][-1]["end"], 60)
+
     def test_finish_twice_and_append_after_finish_fail(self):
         s = meetings.Session(StubModel(), None, 8)
         s.append(1, to_webm(self._speechy(4)))
@@ -230,6 +255,13 @@ class SpeakerLinking(unittest.TestCase):
         s._link({"x": (self.A, 10)})
         names = s._link({"y": (self.A, 4), "z": (self.A + 0.05 * self.B, 3)})
         self.assertEqual(names["y"], names["z"])
+
+    def test_max_speakers_caps_the_whole_meeting(self):
+        s = meetings.Session(StubModel(), None, 2)       # e.g. two listed attendees
+        s._link({"x": (self.A, 10), "y": (self.B, 10)})
+        names = s._link({"z": (self.C, 10)})             # a third voice in a later window
+        self.assertIn(names["z"], ("SPEAKER_0", "SPEAKER_1"))
+        self.assertEqual(len(s.speakers), 2)
 
     def test_known_speaker_count_caps_new_speakers(self):
         s = meetings.Session(StubModel(), 2, 8)

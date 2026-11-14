@@ -29,6 +29,7 @@ MIN_DIARIZE_SEC = 20.0
 SAME_SPEAKER = float(os.environ.get("SAME_SPEAKER_SIMILARITY", "0.5"))
 # Sessions nobody has touched for this long are dropped (the client fell back or went away).
 IDLE_EXPIRY_SEC = 3 * 3600
+EXPIRY_SWEEP_SEC = 600
 
 # process_window(audio, max_speakers, single_speaker) ->
 #   {"segments": [{start, end, speaker, text}], "words": [{word, start, end, speaker}],
@@ -64,16 +65,27 @@ class Session:
         self._lock = threading.Lock()        # appends vs. reading the audio
         self._process_lock = threading.Lock()
         self._queued = False
+        self._next_seq: dict[int, int] = {}  # part -> the piece number expected next
 
     # -- audio --------------------------------------------------------------
 
-    def append(self, part: int, data: bytes):
+    def append(self, part: int, data: bytes, seq: int | None = None) -> bool:
         """Adds bytes to recorder part `part`. A new part number starts a new stream (a resumed
-        recording); parts are joined in the order they first arrive."""
+        recording); parts are joined in the order they first arrive.
+
+        seq numbers the pieces of a part from 0. A piece that already arrived (a client retrying
+        after a lost response) is ignored rather than appended twice; a skipped piece is an error,
+        since the stream can't be decoded past a gap. Returns False for an ignored duplicate."""
         with self._lock:
             if self.closed:
                 raise SessionError("meeting already finished")
             self.touched = time.time()
+            if seq is not None:
+                expected = self._next_seq.get(part, 0)
+                if seq < expected:
+                    return False
+                if seq > expected:
+                    raise SessionError(f"part {part} piece {expected} is missing (got piece {seq})")
             if not self.parts or self.parts[-1][0] != part:
                 if any(p == part for p, _ in self.parts):
                     raise SessionError(f"part {part} already ended; parts must arrive in order")
@@ -81,7 +93,10 @@ class Session:
                     self.parts[-1][1].close()
                 self.parts.append((part, StreamDecoder()))
             decoder = self.parts[-1][1]
-        decoder.feed(data)
+            decoder.feed(data)
+            if seq is not None:
+                self._next_seq[part] = seq + 1
+        return True
 
     def _length(self) -> int:
         return sum(len(d) for _, d in self.parts)
@@ -115,6 +130,16 @@ class Session:
                     break
                 self._process_audio(audio, self.done)
                 self.done += len(audio)
+                self._drop_processed()
+
+    def _drop_processed(self):
+        """Frees decoded audio that has been transcribed; only the unprocessed tail stays in memory."""
+        base = 0
+        for _, d in self.parts:
+            n = len(d)
+            if self.done > base:
+                d.drop_before(min(self.done, base + n) - base)
+            base += n
 
     def _process_audio(self, audio: np.ndarray, start: int):
         if is_silent(audio):
@@ -138,7 +163,8 @@ class Session:
             emb = _unit(emb)
             sims = [float(emb @ s["emb"]) for s in self.speakers]
             best = int(np.argmax(sims)) if sims else None
-            full = self.num_speakers is not None and len(self.speakers) >= self.num_speakers
+            # the cap (num_speakers, else max_speakers) holds for the whole meeting, not just per window
+            full = len(self.speakers) >= self.max_speakers
             if best is not None and (sims[best] >= SAME_SPEAKER or full):
                 s = self.speakers[best]
                 s["emb"] = _unit(s["emb"] * s["weight"] + emb * secs)
@@ -200,6 +226,17 @@ class Registry:
         # one background worker: windows run one at a time, and the GPU lock serializes them
         # with normal requests anyway
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="meeting")
+        # abandoned sessions (a closed tab, a lost discard) are swept on a timer, not only when
+        # the next meeting starts, so their decoders and audio don't linger for days
+        threading.Thread(target=self._sweep, daemon=True, name="meeting-expiry").start()
+
+    def _sweep(self):
+        while True:
+            time.sleep(EXPIRY_SWEEP_SEC)
+            try:
+                self.expire()
+            except Exception:
+                pass
 
     def create(self, num_speakers: int | None, max_speakers: int) -> Session:
         self.expire()

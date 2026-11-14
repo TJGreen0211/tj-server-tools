@@ -202,15 +202,16 @@ def _session(sid: str) -> meetings.Session:
 
 
 @app.post("/v1/meetings/{sid}/audio")
-def meeting_audio(sid: str, file: UploadFile = File(...), part: int = Form(1)):
-    """Appends the next piece of recorder part `part`. Pieces must arrive in order."""
+def meeting_audio(sid: str, file: UploadFile = File(...), part: int = Form(1), seq: int | None = Form(None)):
+    """Appends the next piece of recorder part `part`. Pieces must arrive in order; `seq` (0, 1, 2, ...
+    per part) lets a retried piece be recognised and ignored instead of appended twice."""
     session = _session(sid)
     try:
-        session.append(part, file.file.read())
+        appended = session.append(part, file.file.read(), seq)
     except (meetings.SessionError, RuntimeError) as e:
         raise HTTPException(409, str(e))
     session.schedule(meeting_sessions.executor)
-    return session.status()
+    return {**session.status(), "duplicate": not appended}
 
 
 @app.get("/v1/meetings/{sid}")
