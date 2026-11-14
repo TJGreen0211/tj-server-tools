@@ -1,6 +1,8 @@
-"""Test the speech service: WER per language, request latency, and diarization accuracy.
+"""Test the speech service: WER per language, request latency, diarization accuracy, the effect of
+browser audio compression, and streamed meeting sessions.
 
-Run inside the speech container (needs soundfile + ffmpeg):  python /tests/run.py [wer|latency|diarize]"""
+Run inside the speech container (needs soundfile + ffmpeg):
+    python /tests/run.py [wer|latency|diarize|codec|meeting]"""
 import io
 import json
 import os
@@ -18,10 +20,11 @@ from pathlib import Path
 import soundfile as sf
 
 AUDIO = Path(__file__).parent / "audio"
-URL = os.environ.get("SPEECH_URL", "http://speech:8000") + "/v1/audio/transcriptions"
+BASE = os.environ.get("SPEECH_URL", "http://speech:8000") + "/v1"
+URL = BASE + "/audio/transcriptions"
 
 
-def post(files, **fields):
+def post(files, url=URL, **fields):
     """files: list of (filename, bytes). Returns parsed JSON, or text for response_format=text."""
     boundary = uuid.uuid4().hex
     body = b""
@@ -31,7 +34,7 @@ def post(files, **fields):
         body += f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n\r\n'.encode()
         body += data + b"\r\n"
     body += f"--{boundary}--\r\n".encode()
-    req = urllib.request.Request(URL, body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    req = urllib.request.Request(url, body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
     raw = urllib.request.urlopen(req, timeout=600).read()
     return raw.decode() if fields.get("response_format") == "text" else json.loads(raw)
 
@@ -140,7 +143,45 @@ def diarize():
     score_diarization(out, "2 webm parts", time.time() - start)
 
 
+def to_webm(wav: Path, bitrate: str) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "out.webm"
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", wav, "-c:a", "libopus", "-b:a", bitrate, out],
+                       check=True)
+        return out.read_bytes()
+
+
+def codec():
+    """The same conversation lossless vs. webm/opus at several bitrates, each sent as ONE file, so the
+    only difference is compression. openlumara's meeting recorder uses 64k."""
+    fields = {"response_format": "verbose_json", "diarize": "true"}
+    wav = AUDIO / "conversation.wav"
+    variants = [("wav (lossless)", file(wav))]
+    variants += [(f"webm/opus {b}", [("conversation.webm", to_webm(wav, b))]) for b in ("32k", "64k", "128k")]
+    for label, files in variants:
+        start = time.time()
+        out = post(files, **fields)
+        score_diarization(out, label, time.time() - start)
+
+
+def meeting():
+    """Streams the conversation through a meeting session the way openlumara does (webm/opus 64k,
+    sent in ~15 s pieces while it plays), then finishes it. Windows are MEETING_WINDOW_SEC long on
+    the server (default 480 s); start the service with a smaller value to exercise several windows."""
+    data = to_webm(AUDIO / "conversation.wav", "64k")
+    piece = 64000 // 8 * 15
+    sid = post([], url=BASE + "/meetings")["id"]
+    start = time.time()
+    for i in range(0, len(data), piece):
+        status = post([("chunk.webm", data[i:i + piece])], url=f"{BASE}/meetings/{sid}/audio", part=1)
+    print(f"meeting streamed     received={status['received_sec']}s  processed before finish={status['processed_sec']}s")
+    finish_start = time.time()
+    out = post([], url=f"{BASE}/meetings/{sid}/finish")
+    print(f"meeting finish took  {time.time() - finish_start:.1f}s")
+    score_diarization(out, "streamed session", time.time() - start)
+
+
 if __name__ == "__main__":
-    tests = {"wer": wer, "latency": latency, "diarize": diarize}
+    tests = {"wer": wer, "latency": latency, "diarize": diarize, "codec": codec, "meeting": meeting}
     for name in sys.argv[1:] or tests:
         tests[name]()

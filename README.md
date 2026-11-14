@@ -55,6 +55,34 @@ curl -F file=@meeting.mp3 -F diarize=true -F response_format=text localhost:5003
 
 Without `diarize`, the whole clip goes straight to Parakeet (about 100 ms for a 3 s clip), which suits dictation and live previews. With `diarize=true`, the audio is split into speaker turns and each turn is transcribed separately. Parakeet locks onto one language per stretch of audio, so a recording that mixes English and Spanish should use `diarize=true`, or its minority language can be dropped. A single speaker switching languages mid-sentence is a weak spot either way.
 
+Each speaker turn is cut with 0.25 s of padding on both sides (never past the midpoint to the next turn), so the diarizer's tight boundaries don't clip first and last syllables. Clips with no speech (including whole requests) return empty text instead of a made-up word.
+
+### Meeting sessions
+
+For a live meeting, stream the recording while it happens instead of uploading it at the end. The service transcribes it in windows as it arrives, so finishing only has the last window left to process.
+
+```sh
+id=$(curl -s -X POST localhost:5003/v1/meetings | jq -r .id)
+curl -F part=1 -F file=@chunk1.webm localhost:5003/v1/meetings/$id/audio   # repeat, in order
+curl -X POST localhost:5003/v1/meetings/$id/finish                         # verbose_json with speakers
+```
+
+| Endpoint | Notes |
+|---|---|
+| `POST /v1/meetings` | Starts a session. Optional `num_speakers`, `max_speakers` (as above). Returns `{"id"}` |
+| `POST /v1/meetings/{id}/audio` | Fields `file` (the next piece of the stream) and `part`. Pieces of one part form one continuous stream (e.g. MediaRecorder timeslices, which aren't playable on their own); a new `part` number starts a new stream, for a recording resumed after a pause. Parts are joined in order. Returns progress |
+| `GET /v1/meetings/{id}` | Progress: `received_sec`, `processed_sec`, `speakers`, last background `error` |
+| `POST /v1/meetings/{id}/finish` | Transcribes the rest and returns the meeting like `diarize=true` (`response_format` as above). Ends the session |
+| `DELETE /v1/meetings/{id}` | Drops a session. Idle sessions are dropped after 3 hours anyway |
+
+Each window is diarized on its own, then its speakers are matched to the meeting's speakers so far by voice (TitaNet embeddings, cosine similarity): a close match keeps the label, otherwise it's a new speaker. That is less exact than one pass over the whole recording, mostly for people who say very little in a window. A final window under 20 s is treated as one speaker turn.
+
+| Environment variable | Default | Notes |
+|---|---|---|
+| `MEETING_WINDOW_SEC` | `480` | Window length. Each window ends at the quietest moment in its last minute. Longer windows give each speaker more audio to be recognised by |
+| `SAME_SPEAKER_SIMILARITY` | `0.5` | Voice similarity at which two windows' speakers count as the same person. Lower merges more, higher splits more |
+| `SILENCE_RMS` | `0.005` | Loudness below which a clip counts as silent (full scale = 1.0) |
+
 ## Text to speech
 
 ```sh
@@ -84,7 +112,10 @@ curl localhost:5004/v1/voices
 ```sh
 make test-audio   # public clips: LibriSpeech test-clean + MLS Spanish (CC-BY 4.0), plus a 6-speaker en/es conversation
 make test         # needs `make up`
+make test-unit    # meeting-session plumbing with the models stubbed out; no GPU needed
 ```
+
+`make test` runs every mode of `tests/run.py`. To run a subset, name the modes (`wer latency diarize codec meeting`): `docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py codec meeting`. `codec` sends the conversation once as lossless WAV and once each as single-file webm/opus at 32k, 64k and 128k, to show what browser compression costs on its own. `meeting` streams it through a meeting session in 15 s pieces.
 
 Results on the 7900 XTX:
 

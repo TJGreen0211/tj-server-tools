@@ -1,4 +1,4 @@
-.PHONY: build up down logs gpu-check test-audio test
+.PHONY: build up down logs gpu-check test-audio test test-unit
 
 build:
 	docker compose build
@@ -25,3 +25,7 @@ test-audio:
 # WER per language, request latency and diarization accuracy against the running speech service.
 test:
 	docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py
+
+# Meeting-session plumbing (decoder, windows, speaker linking); no GPU or running service needed.
+test-unit:
+	docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/test_meetings.py

@@ -6,15 +6,19 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
-from nemo.collections.asr.models import ASRModel
+from nemo.collections.asr.models import ASRModel, EncDecSpeakerLabelModel
 from omegaconf import open_dict
 
+import meetings
+from audio import FFMPEG, SAMPLE_RATE, is_silent, pad_turns
 from diarize import diarize
 
 MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
-SAMPLE_RATE = 16000
+SPEAKER_MODEL = "titanet_large"  # the same voice-embedding model the diarizer uses
+# a meeting speaker's voice embedding is taken from up to this much of their speech per window
+EMBED_MAX_SEC = 30
 
 # Skip MIOpen: it compiles kernels for every new audio length (minutes per request) and its
 # LSTM fails on first use. PyTorch's own ROCm kernels are about as fast here with neither problem.
@@ -30,13 +34,15 @@ with open_dict(decoding_cfg):
     decoding_cfg.greedy.use_cuda_graph_decoder = False
 model.change_decoding_strategy(decoding_cfg)
 
+speaker_model = EncDecSpeakerLabelModel.from_pretrained(SPEAKER_MODEL, map_location="cuda").eval()
+
 gpu_lock = threading.Lock()
 app = FastAPI()
 
 
 def to_wav(src: Path, dst: Path) -> None:
     subprocess.run(
-        ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(src), "-ac", "1", "-ar", str(SAMPLE_RATE), str(dst)],
+        [FFMPEG, "-nostdin", "-loglevel", "error", "-y", "-i", str(src), "-ac", "1", "-ar", str(SAMPLE_RATE), str(dst)],
         check=True,
     )
 
@@ -55,8 +61,13 @@ def load_audio(uploads: list[UploadFile], work_dir: Path) -> tuple[Path, np.ndar
     return wav, audio
 
 
+EMPTY = {"text": "", "segments": [], "words": []}
+
+
 def transcribe_plain(audio: np.ndarray) -> dict:
     """Whole clip in one pass: fast, for short single-speaker audio like dictation."""
+    if is_silent(audio):
+        return EMPTY
     with gpu_lock, torch.inference_mode():
         hyp = model.transcribe([audio], timestamps=True, verbose=False)[0]
     segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["segment"]} for s in hyp.timestamp["segment"]]
@@ -64,27 +75,68 @@ def transcribe_plain(audio: np.ndarray) -> dict:
     return {"text": hyp.text, "segments": segments, "words": words}
 
 
-def transcribe_diarized(wav: Path, audio: np.ndarray, work_dir: Path, num_speakers: int | None, max_speakers: int) -> dict:
-    """Diarize, then transcribe each speaker turn on its own.
+def transcribe_turns(audio: np.ndarray, turns: list[dict]) -> tuple[list, list]:
+    """Transcribes each speaker turn on its own (caller holds gpu_lock).
 
     Parakeet picks one language per stretch of audio, so transcribing turns separately
-    keeps English and Spanish turns from swallowing each other."""
-    with gpu_lock, torch.inference_mode():
-        turns = diarize(wav, work_dir, num_speakers, max_speakers)
-        clips = [audio[int(t["start"] * SAMPLE_RATE): int(t["end"] * SAMPLE_RATE)] for t in turns]
-        hyps = model.transcribe(clips, batch_size=8, timestamps=True, verbose=False) if clips else []
+    keeps English and Spanish turns from swallowing each other. Each turn is cut with a
+    little padding so its first and last syllables survive; silent turns are skipped."""
+    kept, clips = [], []
+    for turn, (lo, hi) in zip(turns, pad_turns(turns, len(audio) / SAMPLE_RATE)):
+        clip = audio[int(lo * SAMPLE_RATE): int(hi * SAMPLE_RATE)]
+        if not is_silent(clip):
+            kept.append((turn, lo))
+            clips.append(clip)
+    hyps = model.transcribe(clips, batch_size=8, timestamps=True, verbose=False) if clips else []
 
     segments, words = [], []
-    for turn, hyp in zip(turns, hyps):
+    for (turn, off), hyp in zip(kept, hyps):
         if not hyp.text.strip():
             continue
-        off = turn["start"]
-        segments.append({"start": round(off, 2), "end": round(turn["end"], 2), "speaker": turn["speaker"], "text": hyp.text})
+        segments.append({"start": round(turn["start"], 2), "end": round(turn["end"], 2), "speaker": turn["speaker"], "text": hyp.text})
         words += [
             {"word": w["word"], "start": round(off + w["start"], 2), "end": round(off + w["end"], 2), "speaker": turn["speaker"]}
             for w in hyp.timestamp["word"]
         ]
+    return segments, words
+
+
+def transcribe_diarized(wav: Path, audio: np.ndarray, work_dir: Path, num_speakers: int | None, max_speakers: int) -> dict:
+    """Diarize the whole recording, then transcribe each speaker turn on its own."""
+    with gpu_lock, torch.inference_mode():
+        turns = diarize(wav, work_dir, num_speakers, max_speakers)
+        segments, words = transcribe_turns(audio, turns)
     return {"text": " ".join(s["text"] for s in segments), "segments": segments, "words": words}
+
+
+def speaker_embeddings(audio: np.ndarray, turns: list[dict]) -> dict:
+    """{speaker: (voice embedding, seconds of speech)} from each speaker's turns (caller holds gpu_lock)."""
+    out = {}
+    for spk in dict.fromkeys(t["speaker"] for t in turns):
+        mine = [t for t in turns if t["speaker"] == spk]
+        clip = np.concatenate([audio[int(t["start"] * SAMPLE_RATE): int(t["end"] * SAMPLE_RATE)] for t in mine])
+        if len(clip) < SAMPLE_RATE // 2:  # too little to embed reliably; loop what there is
+            clip = np.resize(clip, SAMPLE_RATE // 2) if len(clip) else np.zeros(SAMPLE_RATE // 2, dtype=np.float32)
+        emb, _ = speaker_model.infer_segment(clip[: EMBED_MAX_SEC * SAMPLE_RATE])
+        out[spk] = (emb.squeeze().float().cpu().numpy(), sum(t["end"] - t["start"] for t in mine))
+    return out
+
+
+def process_window(audio: np.ndarray, max_speakers: int, single_speaker: bool) -> dict:
+    """One window of a meeting: diarize, transcribe each turn, and embed each speaker's voice."""
+    with tempfile.TemporaryDirectory() as tmp, gpu_lock, torch.inference_mode():
+        if single_speaker:
+            turns = [{"start": 0.0, "end": len(audio) / SAMPLE_RATE, "speaker": "SPEAKER_0"}]
+        else:
+            wav = Path(tmp) / "window.wav"
+            sf.write(wav, audio, SAMPLE_RATE)
+            turns = diarize(wav, Path(tmp), None, max_speakers)
+        segments, words = transcribe_turns(audio, turns)
+        speakers = speaker_embeddings(audio, turns) if turns else {}
+    return {"segments": segments, "words": words, "speakers": speakers}
+
+
+meeting_sessions = meetings.Registry(process_window)
 
 
 def ts(t: float, sep: str) -> str:
@@ -133,3 +185,59 @@ def transcriptions(
     if response_format == "verbose_json":
         return JSONResponse(result)
     return JSONResponse({"text": result["text"]})
+
+
+# -- meetings: the recording streams in while it happens, so finishing only has the last window left
+
+@app.post("/v1/meetings")
+def meeting_start(num_speakers: int | None = Form(None), max_speakers: int = Form(8)):
+    return {"id": meeting_sessions.create(num_speakers, max_speakers).id}
+
+
+def _session(sid: str) -> meetings.Session:
+    session = meeting_sessions.get(sid)
+    if session is None:
+        raise HTTPException(404, "unknown or expired meeting")
+    return session
+
+
+@app.post("/v1/meetings/{sid}/audio")
+def meeting_audio(sid: str, file: UploadFile = File(...), part: int = Form(1)):
+    """Appends the next piece of recorder part `part`. Pieces must arrive in order."""
+    session = _session(sid)
+    try:
+        session.append(part, file.file.read())
+    except (meetings.SessionError, RuntimeError) as e:
+        raise HTTPException(409, str(e))
+    session.schedule(meeting_sessions.executor)
+    return session.status()
+
+
+@app.get("/v1/meetings/{sid}")
+def meeting_status(sid: str):
+    return _session(sid).status()
+
+
+@app.post("/v1/meetings/{sid}/finish")
+def meeting_finish(sid: str, response_format: str = Form("verbose_json")):
+    """Transcribes whatever is left and returns the whole meeting, labelled by speaker."""
+    session = _session(sid)
+    try:
+        result = session.finish()
+    except meetings.SessionError as e:
+        raise HTTPException(409, str(e))
+    finally:
+        meeting_sessions.pop(sid)
+    if response_format == "text":
+        return PlainTextResponse("\n".join(f"[{ts(s['start'], '.')[:8]}] {s['speaker']}: {s['text']}" for s in result["segments"]))
+    if response_format in ("srt", "vtt"):
+        return PlainTextResponse(subtitles(result["segments"], response_format))
+    return JSONResponse(result)
+
+
+@app.delete("/v1/meetings/{sid}")
+def meeting_discard(sid: str):
+    session = meeting_sessions.pop(sid)
+    if session:
+        session.discard()
+    return {"discarded": session is not None}

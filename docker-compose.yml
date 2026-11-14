@@ -17,6 +17,10 @@ services:
       - "0.0.0.0:${SPEECH_PORT:-5003}:8000"
     volumes:
       - ./models:/models
+    environment:
+      - MEETING_WINDOW_SEC=${MEETING_WINDOW_SEC:-480}
+      - SAME_SPEAKER_SIMILARITY=${SAME_SPEAKER_SIMILARITY:-0.5}
+      - SILENCE_RMS=${SILENCE_RMS:-0.005}
 
   tts:
     <<: *gpu
