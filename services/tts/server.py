@@ -98,6 +98,7 @@ class SpeechRequest(BaseModel):
     language: str = "auto"            # ISO code (en, es, ...) or name (English, Spanish, ...) or auto
     response_format: str = "wav"      # pcm | wav | mp3 | flac | opus
     stream: bool | None = None        # pcm always streams; wav streams when true
+    speed: float = 1.0                # 0.25-4.0; changes the pace, not the pitch
     model: str = "qwen3-tts"
 
 
@@ -135,7 +136,7 @@ def speech(req: SpeechRequest, request: Request):
     if fmt not in FORMATS:
         raise HTTPException(400, f"response_format must be one of {list(FORMATS)}")
     try:
-        job = engine.prepare(req.input, req.voice, req.language)
+        job = engine.prepare(req.input, req.voice, req.language, req.speed)
     except RequestError as e:
         raise HTTPException(400, str(e))
 

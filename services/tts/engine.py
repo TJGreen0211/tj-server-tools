@@ -19,6 +19,7 @@ from typing import Iterator
 
 import numpy as np
 
+from tempo import MAX_SPEED, MIN_SPEED, TimeStretch
 from tts_utils import Voice, VoiceError, VoiceStore, chunks, language_name, silence
 
 log = logging.getLogger("uvicorn.error")
@@ -40,6 +41,7 @@ class Job:
     pieces: list[str]
     language: str
     voice: Voice
+    speed: float = 1.0
 
 
 class Engine:
@@ -68,7 +70,7 @@ class Engine:
         busy = self.busy_since
         return {"busy_sec": round(time.monotonic() - busy, 1) if busy else None, "waiting": self._waiting}
 
-    def prepare(self, text: str, voice: str, language: str) -> Job:
+    def prepare(self, text: str, voice: str, language: str, speed: float = 1.0) -> Job:
         """Validates a request up front, so errors become HTTP errors before any audio is sent."""
         text = text or ""
         if len(text) > self.max_input_chars:
@@ -79,11 +81,13 @@ class Engine:
         lang = language_name(language)
         if lang is None:
             raise RequestError(f"unsupported language {language!r}")
+        if not MIN_SPEED <= speed <= MAX_SPEED:
+            raise RequestError(f"speed must be between {MIN_SPEED} and {MAX_SPEED}")
         try:
             v = self.voices.resolve(voice)
         except VoiceError as e:
             raise RequestError(str(e))
-        return Job(pieces, lang, v)
+        return Job(pieces, lang, v, float(speed))
 
     # -- the GPU ------------------------------------------------------------
 
@@ -118,16 +122,19 @@ class Engine:
     def stream(self, job: Job, stop: threading.Event | None = None, held: bool = False) -> Iterator[np.ndarray]:
         """Audio (float32, mono, sample_rate) as it is generated. Holds the GPU until it is done,
         `stop` is set, the deadline passes (both checked after every chunk), or the generator
-        is closed. held=True: the caller already reserved the GPU."""
+        is closed. held=True: the caller already reserved the GPU. A job's speed is applied
+        as the audio is generated."""
         if not held:
             self.reserve()
         deadline = time.monotonic() + self.max_gen_sec
+        stretch = TimeStretch(job.speed, self.sample_rate) if job.speed != 1 else None
         try:
             for i, text in enumerate(job.pieces):
                 if (stop is not None and stop.is_set()) or time.monotonic() > deadline:
                     return
                 if i:
-                    yield silence(GAP_SEC, self.sample_rate)
+                    gap = silence(GAP_SEC, self.sample_rate)
+                    yield stretch.process(gap) if stretch else gap
                 for audio, _sr, _timing in self.model.generate_voice_clone_streaming(
                         text=text, chunk_size=self.stream_chunk, **self._clone_args(job)):
                     if stop is not None and stop.is_set():
@@ -136,8 +143,14 @@ class Engine:
                         log.warning("speech generation hit its %.0f s limit; stopping", self.max_gen_sec)
                         return
                     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+                    if stretch:
+                        audio = stretch.process(audio)
                     if audio.size:
                         yield audio
+            if stretch:
+                tail = stretch.flush()
+                if tail.size:
+                    yield tail
         finally:
             self._release()
 
@@ -188,7 +201,11 @@ class Engine:
                 parts += [np.asarray(a, dtype=np.float32).reshape(-1) for a in audio_list]
         finally:
             self._release()
-        return np.concatenate(parts) if parts else silence(0.1, self.sample_rate)
+        audio = np.concatenate(parts) if parts else silence(0.1, self.sample_rate)
+        if job.speed != 1:
+            stretch = TimeStretch(job.speed, self.sample_rate)
+            audio = np.concatenate([stretch.process(audio), stretch.flush()])
+        return audio
 
     def voices_changed(self):
         """A voice file was replaced or removed: drop the model's cached reference prompts

@@ -98,6 +98,7 @@ curl localhost:5004/v1/audio/speech -H 'Content-Type: application/json'   -d '{"
 | `voice` | `default` | A saved voice; unknown names use the `default` voice |
 | `response_format` | `wav` | `pcm` (always streamed), `wav` (streamed with `"stream": true`), `mp3`, `flac`, `opus` |
 | `stream` | `false` | Stream a `wav` response as it is generated (the header declares an unknown length) |
+| `speed` | `1.0` | 0.25-4.0. Changes the pace without changing the pitch (WSOLA time-stretch, applied as the audio streams, about 50 ms held back). Up to 2 the speech transcribes as accurately as the original (English and Spanish); at 2.5 words start to blur |
 
 For live playback use `pcm` and play chunks as they arrive: the first audio comes after the first chunk is generated, not after the whole text.
 

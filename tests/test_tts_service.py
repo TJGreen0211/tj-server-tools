@@ -21,6 +21,7 @@ for _src in (Path(__file__).resolve().parent.parent / "services" / "tts", Path("
         break
 
 import engine as eng  # noqa: E402
+import tempo  # noqa: E402
 import tts_utils as tu  # noqa: E402
 
 SR = 24000
@@ -77,6 +78,48 @@ class Utils(unittest.TestCase):
         wav = tu.encode(tone(0.5), SR, "wav")
         self.assertEqual(wav[:4], b"RIFF")
         self.assertEqual(tu.encode(tone(0.5), SR, "mp3")[:3] in (b"ID3", b"\xff\xfb", b"\xff\xf3"), True)
+
+
+def pitch(audio, rate=SR):
+    """The strongest frequency in the middle of a clip."""
+    mid = audio[len(audio) // 4: 3 * len(audio) // 4]
+    spectrum = np.abs(np.fft.rfft(mid * np.hanning(len(mid))))
+    return np.fft.rfftfreq(len(mid), 1 / rate)[np.argmax(spectrum)]
+
+
+class Tempo(unittest.TestCase):
+    def stretch(self, audio, speed, chunk=None):
+        st = tempo.TimeStretch(speed, SR)
+        step = chunk or max(1, len(audio))
+        parts = [st.process(audio[i:i + step]) for i in range(0, len(audio), step)]
+        return np.concatenate(parts + [st.flush()])
+
+    def test_length_follows_speed_and_pitch_stays(self):
+        x = tone(3)
+        for speed in (0.5, 0.8, 1.25, 1.5, 2.0, 3.0):
+            y = self.stretch(x, speed)
+            self.assertEqual(len(y), round(len(x) / speed), speed)
+            self.assertEqual(y.dtype, np.float32)
+            self.assertAlmostEqual(pitch(y), 220, delta=3, msg=speed)
+            # no clicks or dropouts in steady sound: the level stays that of the input
+            rms = np.sqrt(np.mean(y[SR // 10: -SR // 10] ** 2))
+            self.assertAlmostEqual(rms, 0.3 / np.sqrt(2), delta=0.03, msg=speed)
+
+    def test_same_output_however_the_input_is_chunked(self):
+        x = (tone(2) + np.random.default_rng(1).normal(0, 0.05, 2 * SR)).astype(np.float32)
+        whole = self.stretch(x, 1.6)
+        for chunk in (97, 480, 6000):
+            np.testing.assert_allclose(self.stretch(x, 1.6, chunk), whole, atol=1e-6)
+        # one sample at a time (slow, so a shorter clip)
+        np.testing.assert_allclose(self.stretch(x[: SR // 4], 1.6, 1), self.stretch(x[: SR // 4], 1.6), atol=1e-6)
+
+    def test_start_is_not_faded_in(self):
+        y = self.stretch(tone(1), 1.5)
+        self.assertGreater(np.abs(y[: int(0.005 * SR)]).max(), 0.1)
+
+    def test_empty_and_tiny_inputs(self):
+        self.assertEqual(len(self.stretch(np.zeros(0, np.float32), 2.0)), 0)
+        self.assertEqual(len(self.stretch(tone(0.01), 2.0)), round(0.01 * SR / 2))
 
 
 class Voices(unittest.TestCase):
@@ -169,6 +212,19 @@ class EngineTests(unittest.TestCase):
         call = self.model.calls[0]
         self.assertEqual((call["language"], call["chunk_size"], call["ref_text"], call["xvec_only"]),
                          ("English", 4, "Reference transcript.", False))
+        self.assertFalse(self.engine.lock.locked())
+
+    def test_speed_changes_stream_and_whole_length_alike(self):
+        with self.assertRaises(eng.RequestError):
+            self.engine.prepare("Hello.", "default", "en", speed=5)
+        with self.assertRaises(eng.RequestError):
+            self.engine.prepare("Hello.", "default", "en", speed=float("nan"))
+        text = "First sentence here. " * 20 + "Last one."
+        normal = sum(len(a) for a in self.engine.stream(self.engine.prepare(text, "default", "en")))
+        job = self.engine.prepare(text, "default", "en", speed=1.5)
+        streamed = np.concatenate(list(self.engine.stream(job)))
+        self.assertEqual(len(streamed), round(normal / 1.5))
+        np.testing.assert_allclose(self.engine.synthesize(job), streamed, atol=1e-6)
         self.assertFalse(self.engine.lock.locked())
 
     def test_abandoned_stream_releases_the_gpu(self):
