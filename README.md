@@ -49,6 +49,8 @@ curl -F file=@meeting.mp3 -F diarize=true -F response_format=text localhost:5003
 
 Without `diarize`, the whole clip goes straight to Parakeet (about 100 ms for a 3 s clip), which suits dictation and live previews. With `diarize=true`, the audio is split into speaker turns and each turn is transcribed separately. Parakeet locks onto one language per stretch of audio, so a recording that mixes English and Spanish should use `diarize=true`, or its minority language can be dropped. A single speaker switching languages mid-sentence is a weak spot either way.
 
+Without `diarize`, audio is padded with silence to a whole number of seconds. The GPU picks its kernels the first time it sees an input length, which adds 0.5-0.9 s to that request, and live captions send a new length every time. Startup runs each length up to `STT_WARM_SEC` (default 60) once in the background, so captions stay at about 0.2 s from the first one. Set it to `0` to skip the warm-up.
+
 Each speaker turn is cut with 0.25 s of padding on both sides (never past the midpoint to the next turn), so the diarizer's tight boundaries don't clip first and last syllables. Clips with no speech (including whole requests) return empty text instead of a made-up word.
 
 ### Meeting sessions

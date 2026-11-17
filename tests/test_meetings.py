@@ -100,6 +100,20 @@ class TidyText(unittest.TestCase):
             self.assertEqual(audio.tidy_text(text), text)
 
 
+class WholeSeconds(unittest.TestCase):
+    def test_pads_with_silence_to_the_next_second(self):
+        x = np.ones(int(2.3 * SR), dtype=np.float32)
+        y = audio.pad_to_whole_seconds(x)
+        self.assertEqual(len(y), 3 * SR)
+        self.assertEqual(y.dtype, np.float32)
+        np.testing.assert_array_equal(y[: len(x)], x)
+        self.assertFalse(y[len(x):].any())
+
+    def test_whole_seconds_unchanged(self):
+        x = np.ones(2 * SR, dtype=np.float32)
+        self.assertIs(audio.pad_to_whole_seconds(x), x)
+
+
 class Silence(unittest.TestCase):
     def test_silence_and_short_clips(self):
         self.assertTrue(audio.is_silent(np.zeros(SR * 3, dtype=np.float32)))

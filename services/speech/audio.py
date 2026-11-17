@@ -29,6 +29,17 @@ def tidy_text(text: str) -> str:
     return _GLUED_OPENER.sub(r"\1 \2", text)
 
 
+def pad_to_whole_seconds(audio: np.ndarray) -> np.ndarray:
+    """Pads with silence up to the next whole second. The GPU picks its kernels the first
+    time it sees an input length (0.5-0.9 s extra on that request), and live captions send
+    a new length every time; whole seconds keep the set of lengths small enough to warm up."""
+    step = SAMPLE_RATE
+    target = -(-len(audio) // step) * step
+    if target == len(audio):
+        return audio
+    return np.concatenate([audio, np.zeros(target - len(audio), dtype=audio.dtype)])
+
+
 def pad_turns(turns: list[dict], duration: float) -> list[tuple[float, float]]:
     """(start, end) to cut for each turn: padded, but never past the midpoint to a neighbouring turn."""
     bounds = []

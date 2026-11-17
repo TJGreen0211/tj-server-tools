@@ -1,6 +1,9 @@
+import logging
+import os
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,13 +15,17 @@ from nemo.collections.asr.models import ASRModel, EncDecSpeakerLabelModel
 from omegaconf import open_dict
 
 import meetings
-from audio import FFMPEG, SAMPLE_RATE, is_silent, pad_turns, tidy_text
+from audio import FFMPEG, SAMPLE_RATE, is_silent, pad_to_whole_seconds, pad_turns, tidy_text
 from diarize import diarize
 
 MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
 SPEAKER_MODEL = "titanet_large"  # the same voice-embedding model the diarizer uses
 # a meeting speaker's voice embedding is taken from up to this much of their speech per window
 EMBED_MAX_SEC = 30
+# clip lengths (whole seconds) run once at startup so live captions never hit a cold length
+WARM_SEC = int(os.environ.get("STT_WARM_SEC", "60"))
+
+log = logging.getLogger("uvicorn.error")
 
 # Load and convert on CPU: putting fp32 weights on the GPU first would peak past what is
 # left after tts, and fp16 halves the resident size so all three models fit one 8 GB card.
@@ -39,6 +46,21 @@ speaker_model = EncDecSpeakerLabelModel.from_pretrained(SPEAKER_MODEL, map_locat
 
 gpu_lock = threading.Lock()
 app = FastAPI()
+
+
+def _warm_up():
+    """Runs every whole-second length up to WARM_SEC once (see pad_to_whole_seconds), one
+    at a time under the GPU lock so real requests are served in between."""
+    start = time.monotonic()
+    noise = np.random.default_rng(0).normal(0, 0.01, WARM_SEC * SAMPLE_RATE).astype(np.float32)
+    for sec in range(1, WARM_SEC + 1):
+        with gpu_lock, torch.inference_mode():
+            model.transcribe([noise[: sec * SAMPLE_RATE]], timestamps=True, verbose=False)
+    log.info("speech warm-up: clip lengths 1-%d s ready in %.0f s", WARM_SEC, time.monotonic() - start)
+
+
+if WARM_SEC > 0:
+    threading.Thread(target=_warm_up, daemon=True, name="stt-warm-up").start()
 
 
 def to_wav(src: Path, dst: Path) -> None:
@@ -70,7 +92,7 @@ def transcribe_plain(audio: np.ndarray) -> dict:
     if is_silent(audio):
         return EMPTY
     with gpu_lock, torch.inference_mode():
-        hyp = model.transcribe([audio], timestamps=True, verbose=False)[0]
+        hyp = model.transcribe([pad_to_whole_seconds(audio)], timestamps=True, verbose=False)[0]
     segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": tidy_text(s["segment"])}
                 for s in hyp.timestamp["segment"]]
     words = [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2)} for w in hyp.timestamp["word"]]
