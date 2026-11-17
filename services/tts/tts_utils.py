@@ -159,6 +159,21 @@ class VoiceStore:
             txt.unlink()
         return self.get(name)
 
+    def seed(self, bundled_dir: str | Path, name: str | None = None) -> bool:
+        """Installs the bundled <name>.wav / <name>.txt from bundled_dir if this store has no voice by
+        that name (default: the default voice). An existing voice is never replaced. Returns True if
+        it installed one."""
+        name = name or self.default
+        src = Path(bundled_dir) / f"{name}.wav"
+        if self.get(name) is not None or not src.is_file():
+            return False
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / f"{name}.wav").write_bytes(src.read_bytes())
+        txt = Path(bundled_dir) / f"{name}.txt"
+        if txt.is_file():
+            (self.dir / f"{name}.txt").write_text(txt.read_text(encoding="utf-8").strip(), encoding="utf-8")
+        return True
+
     def remove(self, name: str) -> bool:
         voice = self.get(name)
         if voice is None:

@@ -110,6 +110,22 @@ class Voices(unittest.TestCase):
         with self.assertRaises(tu.VoiceError):
             self.store.add("junk", b"not audio at all")
 
+    def test_bundled_default_voice_is_installed_once_and_never_overrides(self):
+        bundled = Path(__file__).resolve().parent.parent / "services" / "tts" / "default_voice"
+        if not (bundled / "default.wav").exists():
+            bundled = Path("/app/default_voice")
+        info = sf.info(str(bundled / "default.wav"))
+        self.assertTrue(tu.MIN_REF_SEC <= info.duration <= tu.MAX_REF_SEC)
+        self.assertEqual((info.samplerate, info.channels), (tu.VOICE_RATE, 1))
+        self.assertTrue(self.store.seed(bundled))
+        voice = self.store.get("default")
+        self.assertTrue(voice.transcript.startswith("Hi there."))
+        self.assertFalse(voice.xvec_only("auto"))
+        # an uploaded default is never replaced
+        self.store.add("default", self.clip(8), "Mine.")
+        self.assertFalse(self.store.seed(bundled))
+        self.assertEqual(self.store.get("default").transcript, "Mine.")
+
     def test_resolve_falls_back_to_default_then_errors(self):
         with self.assertRaises(tu.VoiceError):
             self.store.resolve("ana")

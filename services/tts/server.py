@@ -42,6 +42,9 @@ model = FasterQwen3TTS.from_pretrained(MODEL_NAME, device="cuda", dtype=DTYPE, a
 model.warmup(prefill_len=100)   # capture the CUDA graphs now, not on the first request
 
 voices = VoiceStore("/voices", default=DEFAULT_VOICE)
+# the repo ships a synthetic default voice (default_voice/); install it unless one was uploaded
+if voices.seed(os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_voice")):
+    log.info("installed the bundled %r voice", DEFAULT_VOICE)
 engine = Engine(model, voices, clone_mode=CLONE_MODE, stream_chunk=STREAM_CHUNK)
 
 

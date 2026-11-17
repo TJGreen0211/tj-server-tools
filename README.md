@@ -79,7 +79,7 @@ Each window is diarized on its own, then its speakers are matched to the meeting
 
 ## Text to speech
 
-Every voice is a clone: Qwen3-TTS has no built-in voice, so upload one named `default` before the first request (see below).
+Every voice is a clone: Qwen3-TTS has no built-in voice. The repo ships a synthetic `default` voice (`services/tts/default_voice/`, generated with Kokoro-82M, Apache-2.0), which is installed into `./voices` on startup unless you have uploaded your own `default` (see below).
 
 ```sh
 # streamed: raw 16-bit mono PCM at the X-Sample-Rate header's rate (24 kHz), sent as it is generated
