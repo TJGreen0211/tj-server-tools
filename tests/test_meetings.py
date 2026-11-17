@@ -89,6 +89,17 @@ class TurnPadding(unittest.TestCase):
         self.assertEqual(audio.pad_turns([{"start": 0.1, "end": 4.9}], 5.0), [(0.0, 5.0)])
 
 
+class TidyText(unittest.TestCase):
+    def test_space_before_inverted_marks(self):
+        self.assertEqual(audio.tidy_text("Incluye las tareas pendientes.¿Quién es responsable?"),
+                         "Incluye las tareas pendientes. ¿Quién es responsable?")
+        self.assertEqual(audio.tidy_text("Bien.¡Vamos!"), "Bien. ¡Vamos!")
+
+    def test_leaves_normal_text_alone(self):
+        for text in ("Ya está. ¿Y tú?", "It costs 3.50 dollars.", "¿Qué?", ""):
+            self.assertEqual(audio.tidy_text(text), text)
+
+
 class Silence(unittest.TestCase):
     def test_silence_and_short_clips(self):
         self.assertTrue(audio.is_silent(np.zeros(SR * 3, dtype=np.float32)))

@@ -12,7 +12,7 @@ from nemo.collections.asr.models import ASRModel, EncDecSpeakerLabelModel
 from omegaconf import open_dict
 
 import meetings
-from audio import FFMPEG, SAMPLE_RATE, is_silent, pad_turns
+from audio import FFMPEG, SAMPLE_RATE, is_silent, pad_turns, tidy_text
 from diarize import diarize
 
 MODEL_NAME = "nvidia/parakeet-tdt-0.6b-v3"
@@ -71,9 +71,10 @@ def transcribe_plain(audio: np.ndarray) -> dict:
         return EMPTY
     with gpu_lock, torch.inference_mode():
         hyp = model.transcribe([audio], timestamps=True, verbose=False)[0]
-    segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["segment"]} for s in hyp.timestamp["segment"]]
+    segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": tidy_text(s["segment"])}
+                for s in hyp.timestamp["segment"]]
     words = [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2)} for w in hyp.timestamp["word"]]
-    return {"text": hyp.text, "segments": segments, "words": words}
+    return {"text": tidy_text(hyp.text), "segments": segments, "words": words}
 
 
 def transcribe_turns(audio: np.ndarray, turns: list[dict]) -> tuple[list, list]:
@@ -94,7 +95,7 @@ def transcribe_turns(audio: np.ndarray, turns: list[dict]) -> tuple[list, list]:
     for (turn, off), hyp in zip(kept, hyps):
         if not hyp.text.strip():
             continue
-        segments.append({"start": round(turn["start"], 2), "end": round(turn["end"], 2), "speaker": turn["speaker"], "text": hyp.text})
+        segments.append({"start": round(turn["start"], 2), "end": round(turn["end"], 2), "speaker": turn["speaker"], "text": tidy_text(hyp.text)})
         words += [
             {"word": w["word"], "start": round(off + w["start"], 2), "end": round(off + w["end"], 2), "speaker": turn["speaker"]}
             for w in hyp.timestamp["word"]

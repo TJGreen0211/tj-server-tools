@@ -1,5 +1,6 @@
 """Audio helpers shared by the transcription endpoints and meeting sessions. No model code here."""
 import os
+import re
 import subprocess
 import threading
 
@@ -16,6 +17,16 @@ TURN_PAD_SEC = 0.25
 # Parakeet makes up a word or two on silence; skipping those clips avoids that.
 SILENCE_RMS = float(os.environ.get("SILENCE_RMS", "0.005"))
 MIN_SPEECH_SEC = 0.3
+
+
+# Parakeet glues a sentence that opens with an inverted mark onto the one before it
+# ("pendientes.¿Quién"); a space goes back in after the closing punctuation.
+_GLUED_OPENER = re.compile(r"([.!?…:;,])([¿¡])")
+
+
+def tidy_text(text: str) -> str:
+    """Fixes spacing Parakeet gets wrong in its output text."""
+    return _GLUED_OPENER.sub(r"\1 \2", text)
 
 
 def pad_turns(turns: list[dict], duration: float) -> list[tuple[float, float]]:
