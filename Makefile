@@ -1,4 +1,4 @@
-.PHONY: build up down logs gpu-check test-audio test test-unit
+.PHONY: build up down logs gpu-check test-audio test test-unit test-tts-unit
 
 build:
 	docker compose build
@@ -29,3 +29,7 @@ test:
 # Meeting-session plumbing (decoder, windows, speaker linking); no GPU or running service needed.
 test-unit:
 	docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/test_meetings.py
+
+# TTS service plumbing (voices, chunking, streaming, GPU lock); no GPU or running service needed.
+test-tts-unit:
+	docker compose run --rm --no-deps -v ./tests:/tests tts python /tests/test_tts_service.py

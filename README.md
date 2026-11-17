@@ -5,9 +5,9 @@ Self-hosted speech services for an NVIDIA GPU (CUDA 12.8 images; ported from an 
 | Service | Model | Port | API |
 |---|---|---|---|
 | `speech` | Parakeet TDT 0.6B v3 + NeMo clustering diarizer | 5003 | `POST /v1/audio/transcriptions` |
-| `tts` | Chatterbox Multilingual (voice cloning) | 5004 | `POST /v1/audio/speech`, `/v1/voices` |
+| `tts` | Qwen3-TTS 0.6B via faster-qwen3-tts (voice cloning, streaming) | 5004 | `POST /v1/audio/speech`, `/v1/voices` |
 
-Both follow the OpenAI audio API shape, with a few extra fields. English and Spanish are tested; Parakeet covers 25 European languages and Chatterbox 23 languages.
+Both follow the OpenAI audio API shape, with a few extra fields. English and Spanish are tested; Parakeet covers 25 European languages; Qwen3-TTS speaks 10 (English, Spanish, German, French, Italian, Portuguese, Russian, Chinese, Japanese, Korean).
 
 ## Install
 
@@ -79,27 +79,45 @@ Each window is diarized on its own, then its speakers are matched to the meeting
 
 ## Text to speech
 
+Every voice is a clone: Qwen3-TTS has no built-in voice, so upload one named `default` before the first request (see below).
+
 ```sh
-curl localhost:5004/v1/audio/speech -H 'Content-Type: application/json' \
-  -d '{"input": "Hola, ¿qué tal?", "language": "es", "voice": "default"}' -o out.wav
+# streamed: raw 16-bit mono PCM at the X-Sample-Rate header's rate (24 kHz), sent as it is generated
+curl localhost:5004/v1/audio/speech -H 'Content-Type: application/json'   -d '{"input": "Hola, ¿qué tal?", "language": "es", "response_format": "pcm"}' -o out.pcm
+
+# a complete file
+curl localhost:5004/v1/audio/speech -H 'Content-Type: application/json'   -d '{"input": "Hello there.", "language": "en", "response_format": "mp3"}' -o out.mp3
 ```
 
 | Field | Default | Notes |
 |---|---|---|
-| `input` | required | Long text is split into sentences and joined |
-| `language` | `en` | `en`, `es`, and the other Chatterbox languages |
-| `voice` | `default` | A saved voice name; unknown names use the built-in voice |
-| `response_format` | `wav` | `wav`, `mp3`, `flac`, `opus` |
-| `exaggeration`, `cfg_weight`, `temperature` | `0.5`, `0.5`, `0.8` | Chatterbox controls for expressiveness and pacing |
+| `input` | required | Long text is generated a few sentences at a time (at most 300 characters each), with a short pause between |
+| `language` | `auto` | ISO code (`en`, `es`, ...), a name (`English`, `Spanish`, ...) or `auto` |
+| `voice` | `default` | A saved voice; unknown names use the `default` voice |
+| `response_format` | `wav` | `pcm` (always streamed), `wav` (streamed with `"stream": true`), `mp3`, `flac`, `opus` |
+| `stream` | `false` | Stream a `wav` response as it is generated (the header declares an unknown length) |
+
+For live playback use `pcm` and play chunks as they arrive: the first audio comes after the first chunk is generated, not after the whole text. One request runs on the GPU at a time; a client that disconnects mid-stream frees it.
 
 ### Cloning a voice
 
-Upload about 10 seconds of clean speech, then use its name as `voice`. Clips are stored in `./voices`. Only clone voices you have permission to use; Chatterbox watermarks its output.
+Upload 3-30 seconds of clean speech (about 10 s is ideal) and, ideally, `text`: what is said in the clip. With the transcript the clone sounds closest to the speaker; without it only the voice's embedding is used, which is a looser match. Clips are stored in `./voices` as `<name>.wav` plus `<name>.txt`. Only clone voices you have permission to use.
 
 ```sh
-curl -F name=alice -F file=@alice.wav localhost:5004/v1/voices
+curl -F name=default -F file=@me.wav -F text="What I say in the clip." localhost:5004/v1/voices
 curl localhost:5004/v1/voices
+curl -X DELETE localhost:5004/v1/voices/alice
 ```
+
+| Environment variable | Default | Notes |
+|---|---|---|
+| `TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` sounds better but is slower |
+| `TTS_DTYPE` | `auto` | `bfloat16` on Ampere and newer, `float16` on Turing (RTX 20xx). Use `float32` if the startup log reports invalid or silent warm-up audio |
+| `TTS_DEFAULT_VOICE` | `default` | The voice used when a request names none, or an unknown one |
+| `TTS_CLONE_MODE` | `auto` | `auto`: full cloning when the voice has a transcript. `xvec`: embedding only for every voice; try it if a cloned voice carries its accent into another language |
+| `TTS_STREAM_CHUNK` | `8` | Codec steps per streamed chunk (12 = 1 s of audio). Lower gives earlier first audio but more decoding overhead |
+
+Startup captures CUDA graphs and, once a `default` voice exists, runs one warm-up sentence, so the first real request isn't the slow one.
 
 ## Testing
 
@@ -107,6 +125,8 @@ curl localhost:5004/v1/voices
 make test-audio   # public clips: LibriSpeech test-clean + MLS Spanish (CC-BY 4.0), plus a 6-speaker en/es conversation
 make test         # needs `make up`
 make test-unit    # meeting-session plumbing with the models stubbed out; no GPU needed
+make test-tts-unit   # TTS service plumbing (voices, chunking, streaming, GPU lock) with the model stubbed out
+python tests/bench_tts.py http://host:5004   # live TTS: time to first audio, speed vs real time, playback stalls
 ```
 
 `make test` runs every mode of `tests/run.py`. To run a subset, name the modes (`wer latency diarize codec meeting`): `docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py codec meeting`. `codec` sends the conversation once as lossless WAV and once each as single-file webm/opus at 32k, 64k and 128k, to show what browser compression costs on its own. `meeting` streams it through a meeting session in 15 s pieces.
@@ -120,13 +140,13 @@ Results on the 7900 XTX (AMD build; numbers will differ on NVIDIA):
 | Request latency (`diarize=false`) | 3 s clip: ~100 ms median; 10–20 s clip: ~150 ms median |
 | Mixed en/es conversation, 6 speakers, `diarize=true` | 2.41% WER, 6 speakers found, 100% of words on the right speaker, ~30x real time |
 | Same conversation sent as 2 webm/opus parts | 4.83% WER, labels still 100% correct |
-| TTS, en/es, built-in and cloned voice | Parakeet reads it back at ~4% WER; generation is about real time |
 
 The conversation is clean read speech with no cross-talk, so real meetings will score lower.
 
 ## Notes
 
-- `speech` runs Python 3.12 (a NeMo dependency doesn't support 3.14 yet); `tts` runs 3.14 because Chatterbox pins torch 2.6 on older Pythons.
+- Both services run Python 3.12 (a NeMo dependency doesn't support 3.14 yet; faster-qwen3-tts needs transformers 5).
+- Both services share one GPU. On an 8 GB card, check `nvidia-smi` with both loaded; the 0.6B TTS model leaves the most room for meeting diarization.
 - The CUDA graph decoder stays off in `speech`: audio length varies per request, so graph capture buys little.
 - Each service handles one request at a time on the GPU; others queue.
 - There is no authentication. The ports bind to `0.0.0.0`, so put the services behind a proxy or firewall.

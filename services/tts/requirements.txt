@@ -1,4 +1,6 @@
-chatterbox-tts==0.1.7
+faster-qwen3-tts==0.5.4
 fastapi==0.162.7
 uvicorn==0.54.0
 python-multipart==0.0.33
+soundfile
+numpy
