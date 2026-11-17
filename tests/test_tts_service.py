@@ -7,6 +7,7 @@ The Qwen3-TTS model is replaced by a stub, so this needs only numpy, soundfile a
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -177,6 +178,96 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(self.engine.lock.locked())
         gen.close()                  # a client that disconnects
         self.assertFalse(self.engine.lock.locked())
+
+    def test_stream_in_thread_stops_and_frees_the_gpu_without_closing(self):
+        # a disconnected HTTP client never closes anything; setting stop must be enough
+        fast = self.model.generate_voice_clone_streaming
+
+        def slow(**kw):   # like the real model: each chunk takes time to generate
+            for item in fast(**kw):
+                time.sleep(0.02)
+                yield item
+        self.model.generate_voice_clone_streaming = slow
+        job = self.engine.prepare("Some words to say. " * 40, "default", "en")
+        total = sum(1 for _ in fast(text=job.pieces[0], language="English")) * len(job.pieces)
+        chunks, stop = self.engine.stream_in_thread(job, len)
+        self.assertGreater(chunks.get(timeout=5), 0)
+        stop.set()
+        items = []
+        while True:
+            item = chunks.get(timeout=5)
+            if item is None:
+                break
+            items.append(item)
+        self.assertLessEqual(len(items), 2, f"generation should end right after stop ({total} chunks in all)")
+        self.assertTrue(self.engine.lock.acquire(timeout=5), "the GPU lock must be free again")
+        self.engine.lock.release()
+
+    def test_stream_in_thread_runs_to_the_end_and_reports_errors(self):
+        job = self.engine.prepare("Hello there. " * 5, "default", "en")
+        chunks, _stop = self.engine.stream_in_thread(job)
+        got = []
+        while (item := chunks.get(timeout=5)) is not None:
+            got.append(item)
+        self.assertAlmostEqual(sum(len(a) for a in got) / SR, 0.01 * len(job.pieces[0]), delta=0.01)
+
+        def boom(**kw):
+            raise RuntimeError("cuda error")
+            yield
+        self.model.generate_voice_clone_streaming = boom
+        chunks, _stop = self.engine.stream_in_thread(job)
+        self.assertIsInstance(chunks.get(timeout=5), RuntimeError)
+        self.assertIsNone(chunks.get(timeout=5))
+        self.assertFalse(self.engine.lock.locked())
+
+    def test_input_is_capped(self):
+        self.engine.max_input_chars = 50
+        with self.assertRaises(eng.RequestError):
+            self.engine.prepare("x " * 30, "default", "en")
+        self.engine.prepare("x " * 20, "default", "en")
+
+    def test_busy_gpu_gives_busy_not_an_endless_wait(self):
+        self.engine.reserve()                      # someone else is generating
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(eng.Busy):
+                self.engine.reserve(timeout=0.2)
+            self.assertLess(time.monotonic() - t0, 2)
+            self.engine.max_waiting = 0            # nobody may queue at all
+            with self.assertRaises(eng.Busy):
+                self.engine.reserve(timeout=5)
+            self.assertEqual(self.engine.status()["waiting"], 0)
+            self.assertIsNotNone(self.engine.status()["busy_sec"])
+        finally:
+            self.engine._release()
+        self.assertIsNone(self.engine.status()["busy_sec"])
+
+    def test_deadline_stops_generation_nobody_stopped(self):
+        fast = self.model.generate_voice_clone_streaming
+
+        def slow(**kw):
+            for item in fast(**kw):
+                time.sleep(0.05)
+                yield item
+        self.model.generate_voice_clone_streaming = slow
+        self.engine.max_gen_sec = 0.2
+        job = self.engine.prepare("Some words to say. " * 40, "default", "en")
+        chunks, _stop = self.engine.stream_in_thread(job, len)   # never read, never stopped
+        t0 = time.monotonic()
+        self.assertTrue(self.engine.lock.acquire(timeout=5), "the deadline must free the GPU")
+        self.engine.lock.release()
+        self.assertLess(time.monotonic() - t0, 2)
+
+    def test_hung_detects_a_generation_far_past_its_deadline(self):
+        self.engine.max_gen_sec = 10
+        self.assertFalse(self.engine.hung(grace_sec=5))
+        self.engine.reserve()
+        try:
+            self.assertFalse(self.engine.hung(grace_sec=5))
+            self.engine.busy_since = time.monotonic() - 16
+            self.assertTrue(self.engine.hung(grace_sec=5))
+        finally:
+            self.engine._release()
 
     def test_requests_are_serialized(self):
         job = self.engine.prepare("Words. " * 30, "default", "en")

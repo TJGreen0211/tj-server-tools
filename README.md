@@ -97,7 +97,9 @@ curl localhost:5004/v1/audio/speech -H 'Content-Type: application/json'   -d '{"
 | `response_format` | `wav` | `pcm` (always streamed), `wav` (streamed with `"stream": true`), `mp3`, `flac`, `opus` |
 | `stream` | `false` | Stream a `wav` response as it is generated (the header declares an unknown length) |
 
-For live playback use `pcm` and play chunks as they arrive: the first audio comes after the first chunk is generated, not after the whole text. One request runs on the GPU at a time; a client that disconnects mid-stream frees it.
+For live playback use `pcm` and play chunks as they arrive: the first audio comes after the first chunk is generated, not after the whole text.
+
+One request runs on the GPU at a time, and the service doesn't rely on clients to behave: a client that disconnects (even before the first audio) stops its generation within one chunk, one that stalls without reading is cut off at `TTS_MAX_GEN_SEC`, waiting for the GPU is bounded (503 when busy, see `/health` for `busy_sec` and `waiting`), and if the model itself ever hangs, a watchdog exits the process so Docker restarts it.
 
 ### Cloning a voice
 
@@ -116,6 +118,10 @@ curl -X DELETE localhost:5004/v1/voices/alice
 | `TTS_DEFAULT_VOICE` | `default` | The voice used when a request names none, or an unknown one |
 | `TTS_CLONE_MODE` | `auto` | `auto`: full cloning when the voice has a transcript. `xvec`: embedding only for every voice; try it if a cloned voice carries its accent into another language |
 | `TTS_STREAM_CHUNK` | `8` | Codec steps per streamed chunk (12 = 1 s of audio). Lower gives earlier first audio but more decoding overhead |
+| `TTS_MAX_INPUT_CHARS` | `4000` | Longer requests get a 400 |
+| `TTS_MAX_GEN_SEC` | `300` | A generation stops at this point whatever the client does, so no request can hold the GPU longer |
+| `TTS_WAIT_SEC` | `60` | Longest a request waits for the GPU; after that it gets a 503 with `Retry-After` |
+| `TTS_MAX_WAITING` | `8` | When this many requests are already waiting, new ones get a 503 at once |
 
 Startup captures CUDA graphs and, once a `default` voice exists, runs one warm-up sentence, so the first real request isn't the slow one.
 
