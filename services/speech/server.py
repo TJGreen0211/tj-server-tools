@@ -20,21 +20,22 @@ SPEAKER_MODEL = "titanet_large"  # the same voice-embedding model the diarizer u
 # a meeting speaker's voice embedding is taken from up to this much of their speech per window
 EMBED_MAX_SEC = 30
 
-# Skip MIOpen: it compiles kernels for every new audio length (minutes per request) and its
-# LSTM fails on first use. PyTorch's own ROCm kernels are about as fast here with neither problem.
-torch.backends.cudnn.enabled = False
-
-model = ASRModel.from_pretrained(MODEL_NAME, map_location="cuda").eval()
+# Load and convert on CPU: putting fp32 weights on the GPU first would peak past what is
+# left after tts, and fp16 halves the resident size so all three models fit one 8 GB card.
+model = ASRModel.from_pretrained(MODEL_NAME, map_location="cpu").eval()
 # Local attention lets Parakeet handle multi-hour audio without running out of VRAM.
 model.change_attention_model("rel_pos_local_attn", [256, 256])
 model.change_subsampling_conv_chunking_factor(1)
-# CUDA graphs are NVIDIA-only; turn them off for ROCm.
+# Keep the graph decoder off: audio length varies per request, so graph capture buys little.
 decoding_cfg = model.cfg.decoding
 with open_dict(decoding_cfg):
     decoding_cfg.greedy.use_cuda_graph_decoder = False
 model.change_decoding_strategy(decoding_cfg)
+model.half().to("cuda")
 
-speaker_model = EncDecSpeakerLabelModel.from_pretrained(SPEAKER_MODEL, map_location="cuda").eval()
+# fp32 unlike the ASR model: infer_segment feeds float clips straight in, and the diarizer
+# is handed this model, so one fp32 copy serves both paths and matches its embeddings.
+speaker_model = EncDecSpeakerLabelModel.from_pretrained(SPEAKER_MODEL, map_location="cpu").eval().to("cuda")
 
 gpu_lock = threading.Lock()
 app = FastAPI()
@@ -104,7 +105,7 @@ def transcribe_turns(audio: np.ndarray, turns: list[dict]) -> tuple[list, list]:
 def transcribe_diarized(wav: Path, audio: np.ndarray, work_dir: Path, num_speakers: int | None, max_speakers: int) -> dict:
     """Diarize the whole recording, then transcribe each speaker turn on its own."""
     with gpu_lock, torch.inference_mode():
-        turns = diarize(wav, work_dir, num_speakers, max_speakers)
+        turns = diarize(wav, work_dir, num_speakers, max_speakers, speaker_model=speaker_model)
         segments, words = transcribe_turns(audio, turns)
     return {"text": " ".join(s["text"] for s in segments), "segments": segments, "words": words}
 
@@ -130,7 +131,7 @@ def process_window(audio: np.ndarray, max_speakers: int, single_speaker: bool) -
         else:
             wav = Path(tmp) / "window.wav"
             sf.write(wav, audio, SAMPLE_RATE)
-            turns = diarize(wav, Path(tmp), None, max_speakers)
+            turns = diarize(wav, Path(tmp), None, max_speakers, speaker_model=speaker_model)
         segments, words = transcribe_turns(audio, turns)
         speakers = speaker_embeddings(audio, turns) if turns else {}
     return {"segments": segments, "words": words, "speakers": speakers}

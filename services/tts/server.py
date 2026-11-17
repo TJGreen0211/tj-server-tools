@@ -16,9 +16,6 @@ VOICES = Path("/voices")
 MAX_CHUNK = 300  # characters per generation call; Chatterbox degrades on long inputs
 FORMATS = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac", "opus": "audio/ogg"}
 
-# Skip MIOpen: it compiles kernels for every new input shape. PyTorch's own ROCm kernels avoid that.
-torch.backends.cudnn.enabled = False
-
 model = ChatterboxMultilingualTTS.from_pretrained(device=torch.device("cuda"))
 gpu_lock = threading.Lock()
 app = FastAPI()

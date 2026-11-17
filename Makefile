@@ -12,11 +12,11 @@ down:
 logs:
 	docker compose logs -f
 
-# Confirm the containers see only the configured GPU.
+# Confirm the containers see exactly one GPU.
 gpu-check:
 	docker compose run --rm --no-deps speech python -c "import torch; \
-	print('hip', torch.version.hip, '| devices', torch.cuda.device_count()); \
-	[print(i, torch.cuda.get_device_name(i), torch.cuda.get_device_properties(i).gcnArchName) for i in range(torch.cuda.device_count())]"
+	print('cuda', torch.version.cuda, '| devices', torch.cuda.device_count()); \
+	[print(i, torch.cuda.get_device_name(i)) for i in range(torch.cuda.device_count())]"
 
 # Download public test clips (LibriSpeech + MLS Spanish, CC-BY 4.0) into tests/audio.
 test-audio:

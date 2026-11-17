@@ -1,6 +1,6 @@
 # tj-server-tools
 
-Self-hosted speech services for an AMD GPU (built and tested on an RX 7900 XTX), packaged as Docker Compose.
+Self-hosted speech services for an NVIDIA GPU (CUDA 12.8 images; ported from an AMD ROCm build), packaged as Docker Compose.
 
 | Service | Model | Port | API |
 |---|---|---|---|
@@ -11,11 +11,11 @@ Both follow the OpenAI audio API shape, with a few extra fields. English and Spa
 
 ## Install
 
-Host needs only Docker with the Compose plugin and the `amdgpu` kernel driver. ROCm, PyTorch and the models live in the containers.
+Host needs Docker with the Compose plugin, an NVIDIA driver, and the NVIDIA Container Toolkit. CUDA, PyTorch and the models live in the containers.
 
 ```sh
 git clone <repo> tj-server-tools && cd tj-server-tools
-cp .env.example .env      # set RENDER_NODE and group IDs for your machine
+cp .env.example .env      # set ports if the defaults are taken
 make build
 make gpu-check            # should list exactly one GPU
 make up
@@ -25,13 +25,7 @@ The first start downloads about 5 GB of models into `./models`. Nothing needs an
 
 ### Picking the GPU
 
-`.env` maps one GPU into the containers, so other GPUs on the host are not touched.
-
-```sh
-ls -l /dev/dri/by-path/            # pci-0000:13:00.0-render -> ../renderD130
-lspci | grep -iE "vga|display"     # match the PCI address to the card
-getent group video render          # VIDEO_GID / RENDER_GID
-```
+The compose file pins both services to one NVIDIA GPU (`NVIDIA_DEVICE_ID` in `.env`, default `0`), so non-NVIDIA GPUs on the host are not touched. Both services share the pinned card and each handles one request at a time; on a multi-GPU host leave them on the same GPU or the per-card memory budget no longer holds.
 
 ## Speech to text
 
@@ -117,7 +111,7 @@ make test-unit    # meeting-session plumbing with the models stubbed out; no GPU
 
 `make test` runs every mode of `tests/run.py`. To run a subset, name the modes (`wer latency diarize codec meeting`): `docker compose run --rm --no-deps -v ./tests:/tests speech python /tests/run.py codec meeting`. `codec` sends the conversation once as lossless WAV and once each as single-file webm/opus at 32k, 64k and 128k, to show what browser compression costs on its own. `meeting` streams it through a meeting session in 15 s pieces.
 
-Results on the 7900 XTX:
+Results on the 7900 XTX (AMD build; numbers will differ on NVIDIA):
 
 | Test | Result |
 |---|---|
@@ -132,8 +126,7 @@ The conversation is clean read speech with no cross-talk, so real meetings will 
 
 ## Notes
 
-- **MIOpen is disabled** in both services. It compiles GPU kernels for every new input shape, which took minutes per request with variable-length audio, and its LSTM failed on first use. PyTorch's own ROCm kernels are as fast here.
 - `speech` runs Python 3.12 (a NeMo dependency doesn't support 3.14 yet); `tts` runs 3.14 because Chatterbox pins torch 2.6 on older Pythons.
-- NVIDIA's `cuda-bindings` package is removed from the speech image; with it installed NeMo crashes looking for an NVIDIA driver.
+- The CUDA graph decoder stays off in `speech`: audio length varies per request, so graph capture buys little.
 - Each service handles one request at a time on the GPU; others queue.
 - There is no authentication. The ports bind to `0.0.0.0`, so put the services behind a proxy or firewall.

@@ -8,7 +8,7 @@ CONFIG = OmegaConf.load(Path(__file__).parent / "diar_config.yaml")
 MERGE_GAP = 1.0  # join same-speaker turns separated by less than this many seconds
 
 
-def diarize(wav: Path, work_dir: Path, num_speakers: int | None, max_speakers: int) -> list[dict]:
+def diarize(wav: Path, work_dir: Path, num_speakers: int | None, max_speakers: int, speaker_model=None) -> list[dict]:
     """Return speaker turns [{start, end, speaker}] for a 16 kHz mono wav."""
     manifest = work_dir / "manifest.json"
     manifest.write_text(json.dumps({
@@ -21,7 +21,7 @@ def diarize(wav: Path, work_dir: Path, num_speakers: int | None, max_speakers: i
     cfg.diarizer.out_dir = str(work_dir)
     cfg.diarizer.clustering.parameters.oracle_num_speakers = num_speakers is not None
     cfg.diarizer.clustering.parameters.max_num_speakers = max_speakers
-    ClusteringDiarizer(cfg=cfg).diarize()
+    ClusteringDiarizer(cfg=cfg, speaker_model=speaker_model).diarize()
 
     turns = []
     for line in (work_dir / "pred_rttms" / f"{wav.stem}.rttm").read_text().splitlines():
