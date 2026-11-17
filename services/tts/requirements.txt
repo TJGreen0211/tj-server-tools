@@ -1,4 +1,8 @@
 faster-qwen3-tts==0.5.4
+# faster-qwen3-tts pins qwen-tts-hf (only release, 0.1.1.post1), which is only verified against
+# transformers==5.15.1; newer 5.x break model loading (MimiConfig.rope_theta, and 5.21 made
+# MimiModel.upsample a read-only property). See the faster-qwen3-tts README.
+transformers==5.15.1
 fastapi==0.162.7
 uvicorn==0.54.0
 python-multipart==0.0.33
