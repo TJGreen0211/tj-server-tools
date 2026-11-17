@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -44,18 +45,35 @@ model.half().to("cuda")
 # is handed this model, so one fp32 copy serves both paths and matches its embeddings.
 speaker_model = EncDecSpeakerLabelModel.from_pretrained(SPEAKER_MODEL, map_location="cpu").eval().to("cuda")
 
-gpu_lock = threading.Lock()
 app = FastAPI()
+
+# All model work runs on this one thread, one job at a time, in the order it was asked for.
+# CUDA libraries keep what they tuned for each input length per thread, so on the web
+# server's pool of request threads every thread paid the 0.5-1 s tuning again for each new
+# length, and a warm-up on its own thread warmed nothing the requests used.
+_gpu = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+
+
+def on_gpu(fn, *args):
+    """Runs fn(*args) on the GPU thread (in inference mode) and returns its result."""
+    def run():
+        with torch.inference_mode():
+            return fn(*args)
+    return _gpu.submit(run).result()
 
 
 def _warm_up():
-    """Runs every whole-second length up to WARM_SEC once (see pad_to_whole_seconds), one
-    at a time under the GPU lock so real requests are served in between."""
+    """Runs every whole-second length up to WARM_SEC once (see pad_to_whole_seconds). Each
+    length is its own job on the GPU thread, so requests arriving meanwhile wait for at most
+    one of them."""
     start = time.monotonic()
     noise = np.random.default_rng(0).normal(0, 0.01, WARM_SEC * SAMPLE_RATE).astype(np.float32)
-    for sec in range(1, WARM_SEC + 1):
-        with gpu_lock, torch.inference_mode():
-            model.transcribe([noise[: sec * SAMPLE_RATE]], timestamps=True, verbose=False)
+    try:
+        for sec in range(1, WARM_SEC + 1):
+            on_gpu(lambda n=sec: model.transcribe([noise[: n * SAMPLE_RATE]], timestamps=True, verbose=False))
+    except Exception:
+        log.exception("speech warm-up failed")
+        return
     log.info("speech warm-up: clip lengths 1-%d s ready in %.0f s", WARM_SEC, time.monotonic() - start)
 
 
@@ -91,8 +109,8 @@ def transcribe_plain(audio: np.ndarray) -> dict:
     """Whole clip in one pass: fast, for short single-speaker audio like dictation."""
     if is_silent(audio):
         return EMPTY
-    with gpu_lock, torch.inference_mode():
-        hyp = model.transcribe([pad_to_whole_seconds(audio)], timestamps=True, verbose=False)[0]
+    clip = pad_to_whole_seconds(audio)
+    hyp = on_gpu(lambda: model.transcribe([clip], timestamps=True, verbose=False)[0])
     segments = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": tidy_text(s["segment"])}
                 for s in hyp.timestamp["segment"]]
     words = [{"word": w["word"], "start": round(w["start"], 2), "end": round(w["end"], 2)} for w in hyp.timestamp["word"]]
@@ -100,7 +118,7 @@ def transcribe_plain(audio: np.ndarray) -> dict:
 
 
 def transcribe_turns(audio: np.ndarray, turns: list[dict]) -> tuple[list, list]:
-    """Transcribes each speaker turn on its own (caller holds gpu_lock).
+    """Transcribes each speaker turn on its own (call on the GPU thread).
 
     Parakeet picks one language per stretch of audio, so transcribing turns separately
     keeps English and Spanish turns from swallowing each other. Each turn is cut with a
@@ -127,14 +145,15 @@ def transcribe_turns(audio: np.ndarray, turns: list[dict]) -> tuple[list, list]:
 
 def transcribe_diarized(wav: Path, audio: np.ndarray, work_dir: Path, num_speakers: int | None, max_speakers: int) -> dict:
     """Diarize the whole recording, then transcribe each speaker turn on its own."""
-    with gpu_lock, torch.inference_mode():
+    def run():
         turns = diarize(wav, work_dir, num_speakers, max_speakers, speaker_model=speaker_model)
-        segments, words = transcribe_turns(audio, turns)
+        return transcribe_turns(audio, turns)
+    segments, words = on_gpu(run)
     return {"text": " ".join(s["text"] for s in segments), "segments": segments, "words": words}
 
 
 def speaker_embeddings(audio: np.ndarray, turns: list[dict]) -> dict:
-    """{speaker: (voice embedding, seconds of speech)} from each speaker's turns (caller holds gpu_lock)."""
+    """{speaker: (voice embedding, seconds of speech)} from each speaker's turns (call on the GPU thread)."""
     out = {}
     for spk in dict.fromkeys(t["speaker"] for t in turns):
         mine = [t for t in turns if t["speaker"] == spk]
@@ -148,16 +167,18 @@ def speaker_embeddings(audio: np.ndarray, turns: list[dict]) -> dict:
 
 def process_window(audio: np.ndarray, max_speakers: int, single_speaker: bool) -> dict:
     """One window of a meeting: diarize, transcribe each turn, and embed each speaker's voice."""
-    with tempfile.TemporaryDirectory() as tmp, gpu_lock, torch.inference_mode():
-        if single_speaker:
-            turns = [{"start": 0.0, "end": len(audio) / SAMPLE_RATE, "speaker": "SPEAKER_0"}]
-        else:
-            wav = Path(tmp) / "window.wav"
-            sf.write(wav, audio, SAMPLE_RATE)
-            turns = diarize(wav, Path(tmp), None, max_speakers, speaker_model=speaker_model)
-        segments, words = transcribe_turns(audio, turns)
-        speakers = speaker_embeddings(audio, turns) if turns else {}
-    return {"segments": segments, "words": words, "speakers": speakers}
+    def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            if single_speaker:
+                turns = [{"start": 0.0, "end": len(audio) / SAMPLE_RATE, "speaker": "SPEAKER_0"}]
+            else:
+                wav = Path(tmp) / "window.wav"
+                sf.write(wav, audio, SAMPLE_RATE)
+                turns = diarize(wav, Path(tmp), None, max_speakers, speaker_model=speaker_model)
+            segments, words = transcribe_turns(audio, turns)
+            speakers = speaker_embeddings(audio, turns) if turns else {}
+        return {"segments": segments, "words": words, "speakers": speakers}
+    return on_gpu(run)
 
 
 meeting_sessions = meetings.Registry(process_window)

@@ -223,7 +223,7 @@ class Registry:
         self.process_window = process_window
         self.sessions: dict[str, Session] = {}
         self.lock = threading.Lock()
-        # one background worker: windows run one at a time, and the GPU lock serializes them
+        # one background worker: windows run one at a time, and the GPU thread serializes them
         # with normal requests anyway
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="meeting")
         # abandoned sessions (a closed tab, a lost discard) are swept on a timer, not only when
