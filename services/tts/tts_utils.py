@@ -1,5 +1,6 @@
 """Helpers for the TTS service: voices, text chunking, language names, audio encoding. No model code here."""
 import io
+import json
 import os
 import re
 import subprocess
@@ -87,7 +88,8 @@ def silence(seconds: float, sample_rate: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# voices: <name>.wav (the reference clip) and an optional <name>.txt (its transcript)
+# voices: <name>.wav (the reference clip), an optional <name>.txt (its transcript) and an
+# optional <name>.json ({"description": "..."}, shown to the people picking a voice)
 # ---------------------------------------------------------------------------
 
 class VoiceError(Exception):
@@ -99,6 +101,7 @@ class Voice:
     name: str
     audio: Path
     transcript: str
+    description: str = ""
 
     def xvec_only(self, clone_mode: str) -> bool:
         """ICL cloning (closest to the reference) needs the transcript; without it, use the speaker
@@ -107,7 +110,7 @@ class Voice:
 
 
 class VoiceStore:
-    def __init__(self, directory: str | Path, default: str = "default"):
+    def __init__(self, directory: str | Path, default: str = "female"):
         self.dir = Path(directory)
         self.default = default
 
@@ -123,7 +126,20 @@ class VoiceStore:
         if not audio.is_file():
             return None
         txt = self.dir / f"{name}.txt"
-        return Voice(name, audio, txt.read_text(encoding="utf-8").strip() if txt.is_file() else "")
+        return Voice(name, audio, txt.read_text(encoding="utf-8").strip() if txt.is_file() else "",
+                     _description(self.dir / f"{name}.json"))
+
+    def listing(self) -> list[dict]:
+        """Every voice as {name, description, transcript}, the default voice first, for clients
+        to offer as the voices to pick from."""
+        names = self.names()
+        names.sort(key=lambda n: n != self.default)
+        out = []
+        for name in names:
+            voice = self.get(name)
+            if voice is not None:
+                out.append({"name": name, "description": voice.description, "transcript": bool(voice.transcript)})
+        return out
 
     def resolve(self, name: str) -> Voice:
         """The named voice, else the default voice. Raises VoiceError when neither exists."""
@@ -135,8 +151,9 @@ class VoiceStore:
             )
         return voice
 
-    def add(self, name: str, data: bytes, transcript: str = "") -> Voice:
-        """Stores a reference clip (any format ffmpeg reads) as 24 kHz mono WAV, plus its transcript."""
+    def add(self, name: str, data: bytes, transcript: str = "", description: str = "") -> Voice:
+        """Stores a reference clip (any format ffmpeg reads) as 24 kHz mono WAV, plus its transcript
+        and description."""
         if not VOICE_NAME.fullmatch(name or ""):
             raise VoiceError("name may only contain letters, digits, _ and -")
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -157,29 +174,49 @@ class VoiceStore:
             txt.write_text(transcript.strip(), encoding="utf-8")
         elif txt.exists():
             txt.unlink()
+        meta = self.dir / f"{name}.json"
+        if description.strip():
+            meta.write_text(json.dumps({"description": description.strip()}), encoding="utf-8")
+        elif meta.exists():
+            meta.unlink()
         return self.get(name)
 
-    def seed(self, bundled_dir: str | Path, name: str | None = None) -> bool:
-        """Installs the bundled <name>.wav / <name>.txt from bundled_dir if this store has no voice by
-        that name (default: the default voice). An existing voice is never replaced. Returns True if
-        it installed one."""
-        name = name or self.default
-        src = Path(bundled_dir) / f"{name}.wav"
-        if self.get(name) is not None or not src.is_file():
-            return False
-        self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / f"{name}.wav").write_bytes(src.read_bytes())
-        txt = Path(bundled_dir) / f"{name}.txt"
-        if txt.is_file():
-            (self.dir / f"{name}.txt").write_text(txt.read_text(encoding="utf-8").strip(), encoding="utf-8")
-        return True
+    def seed(self, bundled_dir: str | Path) -> list[str]:
+        """Installs every bundled voice (<name>.wav plus its .txt / .json) from bundled_dir that this
+        store has no voice by that name for. An existing voice is never replaced. Returns the names
+        it installed."""
+        installed = []
+        for src in sorted(Path(bundled_dir).glob("*.wav")):
+            name = src.stem
+            if not VOICE_NAME.fullmatch(name) or self.get(name) is not None:
+                continue
+            self.dir.mkdir(parents=True, exist_ok=True)
+            (self.dir / f"{name}.wav").write_bytes(src.read_bytes())
+            for ext in (".txt", ".json"):
+                extra = src.with_suffix(ext)
+                if extra.is_file():
+                    (self.dir / f"{name}{ext}").write_text(extra.read_text(encoding="utf-8").strip(), encoding="utf-8")
+            installed.append(name)
+        return installed
 
     def remove(self, name: str) -> bool:
         voice = self.get(name)
         if voice is None:
             return False
         voice.audio.unlink()
-        txt = self.dir / f"{name}.txt"
-        if txt.exists():
-            txt.unlink()
+        for ext in (".txt", ".json"):
+            extra = self.dir / f"{name}{ext}"
+            if extra.exists():
+                extra.unlink()
         return True
+
+
+def _description(path: Path) -> str:
+    """The description in a voice's <name>.json, or "" when there is none (or it is unreadable)."""
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("description") or "").strip() if isinstance(data, dict) else ""

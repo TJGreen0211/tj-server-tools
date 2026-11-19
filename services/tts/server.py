@@ -29,7 +29,7 @@ from tts_utils import FORMATS, VoiceError, VoiceStore, encode, pcm16
 log = logging.getLogger("uvicorn.error")
 
 MODEL_NAME = os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-DEFAULT_VOICE = os.environ.get("TTS_DEFAULT_VOICE", "default")
+DEFAULT_VOICE = os.environ.get("TTS_DEFAULT_VOICE", "female")
 CLONE_MODE = os.environ.get("TTS_CLONE_MODE", "auto")          # auto | xvec
 STREAM_CHUNK = int(os.environ.get("TTS_STREAM_CHUNK", "8"))     # codec steps per chunk; 12 = 1 s of audio
 MAX_INPUT_CHARS = int(os.environ.get("TTS_MAX_INPUT_CHARS", "4000"))
@@ -54,9 +54,10 @@ model = FasterQwen3TTS.from_pretrained(MODEL_NAME, device="cuda", dtype=DTYPE, a
 model.warmup(prefill_len=100)   # capture the CUDA graphs now, not on the first request
 
 voices = VoiceStore("/voices", default=DEFAULT_VOICE)
-# the repo ships a synthetic default voice (default_voice/); install it unless one was uploaded
-if voices.seed(os.path.join(os.path.dirname(os.path.abspath(__file__)), "default_voice")):
-    log.info("installed the bundled %r voice", DEFAULT_VOICE)
+# the repo ships synthetic voices (bundled_voices/: female, male); install any that aren't there yet,
+# never replacing one that was uploaded under the same name
+for _name in voices.seed(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bundled_voices")):
+    log.info("installed the bundled %r voice", _name)
 engine = Engine(model, voices, clone_mode=CLONE_MODE, stream_chunk=STREAM_CHUNK,
                 max_input_chars=MAX_INPUT_CHARS, max_gen_sec=MAX_GEN_SEC,
                 wait_sec=WAIT_SEC, max_waiting=MAX_WAITING)
@@ -176,18 +177,21 @@ def speech(req: SpeechRequest, request: Request):
 
 @app.get("/v1/voices")
 def list_voices():
-    names = voices.names()
-    return {"voices": names, "default": DEFAULT_VOICE,
-            "with_transcript": [n for n in names if voices.get(n).transcript]}
+    """The voices this server offers, default first. Clients show `details` (name + description)
+    as the voices to pick from; `voices` is the same names as a plain list."""
+    details = voices.listing()
+    return {"voices": [v["name"] for v in details], "default": DEFAULT_VOICE, "details": details,
+            "with_transcript": [v["name"] for v in details if v["transcript"]]}
 
 
 @app.post("/v1/voices")
-def add_voice(name: str = Form(...), file: UploadFile = File(...), text: str = Form("")):
+def add_voice(name: str = Form(...), file: UploadFile = File(...), text: str = Form(""),
+              description: str = Form("")):
     """Saves a cloneable voice: about 10 s of clean speech, plus `text` (what is said in it).
     With the transcript the clone is closer to the speaker; without it only the voice's
-    embedding is used."""
+    embedding is used. `description` is shown to people picking a voice."""
     try:
-        voice = voices.add(name, file.file.read(), text)
+        voice = voices.add(name, file.file.read(), text, description)
     except VoiceError as e:
         raise HTTPException(400, str(e))
     try:

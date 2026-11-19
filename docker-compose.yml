@@ -43,7 +43,7 @@ services:
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - TTS_MODEL=${TTS_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-Base}
       - TTS_DTYPE=${TTS_DTYPE:-float32}   # Turing (RTX 2070 Super): fp16 overflows to NaN, bf16 unsupported
-      - TTS_DEFAULT_VOICE=${TTS_DEFAULT_VOICE:-default}
+      - TTS_DEFAULT_VOICE=${TTS_DEFAULT_VOICE:-female}
       - TTS_CLONE_MODE=${TTS_CLONE_MODE:-auto}
       - TTS_STREAM_CHUNK=${TTS_STREAM_CHUNK:-8}
       - TTS_MAX_INPUT_CHARS=${TTS_MAX_INPUT_CHARS:-4000}

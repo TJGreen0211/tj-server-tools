@@ -81,7 +81,16 @@ Each window is diarized on its own, then its speakers are matched to the meeting
 
 ## Text to speech
 
-Every voice is a clone: Qwen3-TTS has no built-in voice. The repo ships a synthetic `default` voice (`services/tts/default_voice/`, generated with Kokoro-82M, Apache-2.0), which is installed into `./voices` on startup unless you have uploaded your own `default` (see below).
+Every voice is a clone: Qwen3-TTS has no built-in voice. The repo ships two synthetic voices, `female` (the default) and `male` (`services/tts/bundled_voices/`, generated with Kokoro-82M, Apache-2.0). On startup each is installed into `./voices` unless a voice with that name is already there (see below).
+
+The voices in `./voices` are the ones the service offers. `GET /v1/voices` advertises them, default first, so clients (openlumara's voice picker) show exactly these:
+
+```json
+{"voices": ["female", "male"], "default": "female",
+ "details": [{"name": "female", "description": "Female, warm American English (default)", "transcript": true},
+             {"name": "male", "description": "Male, calm American English", "transcript": true}],
+ "with_transcript": ["female", "male"]}
+```
 
 ```sh
 # streamed: raw 16-bit mono PCM at the X-Sample-Rate header's rate (24 kHz), sent as it is generated
@@ -95,7 +104,7 @@ curl localhost:5004/v1/audio/speech -H 'Content-Type: application/json'   -d '{"
 |---|---|---|
 | `input` | required | Long text is generated a few sentences at a time (at most 300 characters each), with a short pause between |
 | `language` | `auto` | ISO code (`en`, `es`, ...), a name (`English`, `Spanish`, ...) or `auto` |
-| `voice` | `default` | A saved voice; unknown names use the `default` voice |
+| `voice` | `female` | A voice from `GET /v1/voices`; unknown names use the default voice (`TTS_DEFAULT_VOICE`) |
 | `response_format` | `wav` | `pcm` (always streamed), `wav` (streamed with `"stream": true`), `mp3`, `flac`, `opus` |
 | `stream` | `false` | Stream a `wav` response as it is generated (the header declares an unknown length) |
 | `speed` | `1.0` | 0.25-4.0. Changes the pace without changing the pitch (WSOLA time-stretch, applied as the audio streams, about 50 ms held back). Up to 2 the speech transcribes as accurately as the original (English and Spanish); at 2.5 words start to blur |
@@ -106,10 +115,10 @@ One request runs on the GPU at a time, and the service doesn't rely on clients t
 
 ### Cloning a voice
 
-Upload 3-30 seconds of clean speech (about 10 s is ideal) and, ideally, `text`: what is said in the clip. With the transcript the clone sounds closest to the speaker; without it only the voice's embedding is used, which is a looser match. Clips are stored in `./voices` as `<name>.wav` plus `<name>.txt`. Only clone voices you have permission to use.
+Adding and removing voices is for whoever runs the service; clients only pick from what `GET /v1/voices` lists. Upload 3-30 seconds of clean speech (about 10 s is ideal) and, ideally, `text`: what is said in the clip. With the transcript the clone sounds closest to the speaker; without it only the voice's embedding is used, which is a looser match. `description` is what clients show next to the name. Clips are stored in `./voices` as `<name>.wav` plus `<name>.txt` and `<name>.json`. Only clone voices you have permission to use.
 
 ```sh
-curl -F name=default -F file=@me.wav -F text="What I say in the clip." localhost:5004/v1/voices
+curl -F name=alice -F file=@alice.wav -F text="What is said in the clip." -F description="Alice, British English" localhost:5004/v1/voices
 curl localhost:5004/v1/voices
 curl -X DELETE localhost:5004/v1/voices/alice
 ```
@@ -118,7 +127,7 @@ curl -X DELETE localhost:5004/v1/voices/alice
 |---|---|---|
 | `TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` sounds better but is slower |
 | `TTS_DTYPE` | `auto` | `bfloat16` on Ampere and newer, `float16` on Turing (RTX 20xx). Use `float32` if the startup log reports invalid or silent warm-up audio |
-| `TTS_DEFAULT_VOICE` | `default` | The voice used when a request names none, or an unknown one |
+| `TTS_DEFAULT_VOICE` | `female` | The voice used when a request names none, or an unknown one; listed first by `GET /v1/voices` |
 | `TTS_CLONE_MODE` | `auto` | `auto`: full cloning when the voice has a transcript. `xvec`: embedding only for every voice; try it if a cloned voice carries its accent into another language |
 | `TTS_STREAM_CHUNK` | `8` | Codec steps per streamed chunk (12 = 1 s of audio). Lower gives earlier first audio but more decoding overhead |
 | `TTS_MAX_INPUT_CHARS` | `4000` | Longer requests get a 400 |
@@ -126,7 +135,7 @@ curl -X DELETE localhost:5004/v1/voices/alice
 | `TTS_WAIT_SEC` | `60` | Longest a request waits for the GPU; after that it gets a 503 with `Retry-After` |
 | `TTS_MAX_WAITING` | `8` | When this many requests are already waiting, new ones get a 503 at once |
 
-Startup captures CUDA graphs and, once a `default` voice exists, runs one warm-up sentence, so the first real request isn't the slow one.
+Startup captures CUDA graphs and, once the default voice exists, runs one warm-up sentence, so the first real request isn't the slow one.
 
 ## Testing
 

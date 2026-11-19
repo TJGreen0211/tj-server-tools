@@ -154,35 +154,54 @@ class Voices(unittest.TestCase):
         with self.assertRaises(tu.VoiceError):
             self.store.add("junk", b"not audio at all")
 
-    def test_bundled_default_voice_is_installed_once_and_never_overrides(self):
-        bundled = Path(__file__).resolve().parent.parent / "services" / "tts" / "default_voice"
-        if not (bundled / "default.wav").exists():
-            bundled = Path("/app/default_voice")
-        info = sf.info(str(bundled / "default.wav"))
-        self.assertTrue(tu.MIN_REF_SEC <= info.duration <= tu.MAX_REF_SEC)
-        self.assertEqual((info.samplerate, info.channels), (tu.VOICE_RATE, 1))
-        self.assertTrue(self.store.seed(bundled))
-        voice = self.store.get("default")
-        self.assertTrue(voice.transcript.startswith("Hi there."))
-        self.assertFalse(voice.xvec_only("auto"))
-        # an uploaded default is never replaced
-        self.store.add("default", self.clip(8), "Mine.")
-        self.assertFalse(self.store.seed(bundled))
-        self.assertEqual(self.store.get("default").transcript, "Mine.")
+    def test_bundled_voices_are_installed_once_and_never_override(self):
+        bundled = Path(__file__).resolve().parent.parent / "services" / "tts" / "bundled_voices"
+        if not (bundled / "female.wav").exists():
+            bundled = Path("/app/bundled_voices")
+        for name in ("female", "male"):
+            info = sf.info(str(bundled / f"{name}.wav"))
+            self.assertTrue(tu.MIN_REF_SEC <= info.duration <= tu.MAX_REF_SEC)
+            self.assertEqual((info.samplerate, info.channels), (tu.VOICE_RATE, 1))
+        self.assertEqual(self.store.seed(bundled), ["female", "male"])
+        female, male = self.store.get("female"), self.store.get("male")
+        self.assertTrue(female.transcript.startswith("Hi there."))
+        self.assertTrue(male.transcript.startswith("Hello there."))
+        self.assertIn("Female", female.description)
+        self.assertIn("Male", male.description)
+        self.assertFalse(male.xvec_only("auto"))
+        # an uploaded voice under a bundled name is never replaced
+        self.store.add("male", self.clip(8), "Mine.")
+        self.assertEqual(self.store.seed(bundled), [])
+        self.assertEqual(self.store.get("male").transcript, "Mine.")
+
+    def test_listing_puts_the_default_first_with_descriptions(self):
+        self.store.add("ana", self.clip(6), "Hola.", "Spanish, bright")
+        self.store.add("female", self.clip(6), description="Female (default)")
+        self.store.add("bob", self.clip(6))
+        self.assertEqual(self.store.listing(), [
+            {"name": "female", "description": "Female (default)", "transcript": False},
+            {"name": "ana", "description": "Spanish, bright", "transcript": True},
+            {"name": "bob", "description": "", "transcript": False},
+        ])
+        # re-uploading without a description drops the old one; removing deletes everything
+        self.assertEqual(self.store.add("ana", self.clip(6)).description, "")
+        self.store.add("ana", self.clip(6), description="x")
+        self.assertTrue(self.store.remove("ana"))
+        self.assertEqual(sorted(p.name for p in Path(self.tmp.name).glob("ana.*")), [])
 
     def test_resolve_falls_back_to_default_then_errors(self):
         with self.assertRaises(tu.VoiceError):
             self.store.resolve("ana")
-        self.store.add("default", self.clip(6))
-        self.assertEqual(self.store.resolve("missing").name, "default")
-        self.assertTrue(self.store.remove("default"))
-        self.assertFalse(self.store.remove("default"))
+        self.store.add("female", self.clip(6))
+        self.assertEqual(self.store.resolve("missing").name, "female")
+        self.assertTrue(self.store.remove("female"))
+        self.assertFalse(self.store.remove("female"))
 
 
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = tu.VoiceStore(self.tmp.name)
+        self.store = tu.VoiceStore(self.tmp.name, default="default")
         path = Path(self.tmp.name) / "up.wav"
         sf.write(path, tone(6), SR)
         self.store.add("default", path.read_bytes(), "Reference transcript.")
